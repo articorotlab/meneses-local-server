@@ -274,7 +274,8 @@ export async function transactionRoutes(
                 card_type,
                 status,
                 balance,
-                transaction_counter
+                transaction_counter,
+                current_activation_id
             from cards
             where card_id = $1
             for update
@@ -315,6 +316,18 @@ export async function transactionRoutes(
           await client.query("ROLLBACK");
           return reply.status(409).send({
             error: "CARD_NOT_ACTIVE",
+          });
+        }
+
+        if (
+          card.current_activation_id ===
+          null
+        ) {
+          await client.query("ROLLBACK");
+
+          return reply.status(409).send({
+            error:
+              "CUSTOMER_ACTIVATION_REQUIRED",
           });
         }
 
@@ -363,7 +376,10 @@ export async function transactionRoutes(
                 counter_after,
                 card_write_status,
                 actor_role,
-                actor_card_id
+                actor_card_id,
+                activation_id,
+                ledger_action,
+                credit_fund_type
             )
             values (
                 $1,
@@ -377,7 +393,10 @@ export async function transactionRoutes(
                 $8,
                 'AUTHORIZED',
                 'ADMIN',
-                $9
+                $9,
+                $10,
+                'CREDIT',
+                'ADMIN_CREDIT'
             )
             returning *
             `,
@@ -391,6 +410,7 @@ export async function transactionRoutes(
               serverCounter,
               counterAfter,
               admin.admin_card_id,
+              card.current_activation_id,
             ]
           );
 
@@ -1145,6 +1165,17 @@ export async function transactionRoutes(
 
           await client.query(
             `
+            select financial_commit_credit(
+                $1
+            )
+            `,
+            [
+              transaction.id,
+            ]
+          );
+
+          await client.query(
+            `
             update transactions
             set
                 card_write_status = 'CONFIRMED',
@@ -1465,7 +1496,8 @@ export async function transactionRoutes(
                 card_type,
                 status,
                 balance,
-                transaction_counter
+                transaction_counter,
+                current_activation_id
             from cards
             where card_id = $1
             for update
@@ -1524,6 +1556,19 @@ export async function transactionRoutes(
           return reply.status(409).send({
             error:
               "CARD_NOT_ACTIVE",
+          });
+        }
+
+        if (
+          card.current_activation_id ===
+          null
+        ) {
+
+          await client.query("ROLLBACK");
+
+          return reply.status(409).send({
+            error:
+              "CUSTOMER_ACTIVATION_REQUIRED",
           });
         }
 
@@ -1711,7 +1756,10 @@ export async function transactionRoutes(
                 card_write_status,
                 recharge_point_id,
                 actor_role,
-                actor_card_id
+                actor_card_id,
+                activation_id,
+                ledger_action,
+                credit_fund_type
             )
             values (
                 $1,
@@ -1726,7 +1774,10 @@ export async function transactionRoutes(
                 'AUTHORIZED',
                 $9,
                 'RECHARGE',
-                $10
+                $10,
+                $11,
+                'CREDIT',
+                'CASH'
             )
             returning *
             `,
@@ -1743,6 +1794,8 @@ export async function transactionRoutes(
                 .recharge_point_id,
               rechargeSession
                 .opened_by_card_id,
+              card
+                .current_activation_id,
             ]
           );
 
@@ -2543,6 +2596,17 @@ export async function transactionRoutes(
             writtenBalance,
             writtenCounter,
             cardId,
+          ]
+        );
+
+        await client.query(
+          `
+          select financial_commit_credit(
+              $1
+          )
+          `,
+          [
+            transactionId,
           ]
         );
 
