@@ -1176,6 +1176,17 @@ export async function transactionRoutes(
 
           await client.query(
             `
+            select financial_commit_debit(
+                $1
+            )
+            `,
+            [
+              transaction.id,
+            ]
+          );
+
+          await client.query(
+            `
             update transactions
             set
                 card_write_status = 'CONFIRMED',
@@ -1220,6 +1231,17 @@ export async function transactionRoutes(
           serverBalance === balanceBefore &&
           serverCounter === counterBefore
         ) {
+
+          await client.query(
+            `
+            select financial_release_debit(
+                $1
+            )
+            `,
+            [
+              transaction.id,
+            ]
+          );
 
           await client.query(
             `
@@ -2044,7 +2066,8 @@ export async function transactionRoutes(
                 card_type,
                 status,
                 balance,
-                transaction_counter
+                transaction_counter,
+                current_activation_id
             from cards
             where card_id = $1
             for update
@@ -2103,6 +2126,19 @@ export async function transactionRoutes(
           return reply.status(409).send({
             error:
               "CARD_NOT_ACTIVE",
+          });
+        }
+
+        if (
+          card.current_activation_id ===
+          null
+        ) {
+
+          await client.query("ROLLBACK");
+
+          return reply.status(409).send({
+            error:
+              "CUSTOMER_ACTIVATION_REQUIRED",
           });
         }
 
@@ -2306,7 +2342,9 @@ export async function transactionRoutes(
                 unit_price,
                 quantity,
                 actor_role,
-                actor_card_id
+                actor_card_id,
+                activation_id,
+                ledger_action
             )
             values (
                 $1,
@@ -2323,7 +2361,9 @@ export async function transactionRoutes(
                 $10,
                 $11,
                 'GAME',
-                $12
+                $12,
+                $13,
+                'DEBIT'
             )
             returning *
             `,
@@ -2340,13 +2380,25 @@ export async function transactionRoutes(
               unitPrice,
               peopleCount,
               game.opened_by_card_id,
+              card.current_activation_id,
             ]
           );
 
-        await client.query("COMMIT");
-
         const transaction =
           transactionResult.rows[0];
+
+        await client.query(
+          `
+          select financial_reserve_debit(
+              $1
+          )
+          `,
+          [
+            transaction.id,
+          ]
+        );
+
+        await client.query("COMMIT");
 
         return {
           authorized:
@@ -2612,6 +2664,17 @@ export async function transactionRoutes(
 
         await client.query(
           `
+          select financial_commit_debit(
+              $1
+          )
+          `,
+          [
+            transactionId,
+          ]
+        );
+
+        await client.query(
+          `
           update transactions
           set
               card_write_status =
@@ -2689,8 +2752,64 @@ export async function transactionRoutes(
         reason,
       } = request.body;
 
-      const result =
-        await db.query(
+      const client =
+        await db.connect();
+
+      try {
+
+        await client.query("BEGIN");
+
+        const txResult =
+          await client.query(
+            `
+            select id, card_write_status
+            from transactions
+            where id = $1
+            for update
+            `,
+            [
+              transactionId,
+            ]
+          );
+
+        if (txResult.rowCount === 0) {
+
+          await client.query("ROLLBACK");
+
+          return reply.status(404).send({
+            error:
+              "TRANSACTION_NOT_FOUND",
+          });
+        }
+
+        const tx =
+          txResult.rows[0];
+
+        if (
+          tx.card_write_status !==
+          "AUTHORIZED"
+        ) {
+
+          await client.query("ROLLBACK");
+
+          return reply.status(409).send({
+            error:
+              "TRANSACTION_CANNOT_BE_FAILED",
+          });
+        }
+
+        await client.query(
+          `
+          select financial_release_debit(
+              $1
+          )
+          `,
+          [
+            transactionId,
+          ]
+        );
+
+        await client.query(
           `
           update transactions
           set
@@ -2704,10 +2823,6 @@ export async function transactionRoutes(
                 $2
 
           where id = $1
-            and card_write_status =
-              'AUTHORIZED'
-
-          returning id
           `,
           [
             transactionId,
@@ -2715,20 +2830,30 @@ export async function transactionRoutes(
           ]
         );
 
-      if (result.rowCount === 0) {
+        await client.query("COMMIT");
 
-        return reply.status(409).send({
+        return {
+          failed:
+            true,
+
+          transactionId,
+        };
+
+      } catch (error) {
+
+        await client.query("ROLLBACK");
+
+        server.log.error(error);
+
+        return reply.status(500).send({
           error:
-            "TRANSACTION_CANNOT_BE_FAILED",
+            "INTERNAL_ERROR",
         });
+
+      } finally {
+
+        client.release();
       }
-
-      return {
-        failed:
-          true,
-
-        transactionId,
-      };
     }
   );
 
