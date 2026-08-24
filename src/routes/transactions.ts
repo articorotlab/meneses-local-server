@@ -11,7 +11,23 @@ type RechargeBody = {
   idempotencyKey: string;
   cardId: number;
   uid: string;
-  amount: number;
+
+  /*
+   * Recarga normal:
+   *
+   * amount = monto CASH.
+   *
+   * Recarga promocional:
+   *
+   * promotionId = promoción seleccionada.
+   *
+   * Cuando promotionId existe, el servidor NO confía
+   * en amount para calcular el crédito. Los montos se
+   * obtienen directamente de PostgreSQL.
+   */
+  amount?: number;
+  promotionId?: string;
+
   cardBalance: number;
   cardCounter: number;
   deviceCode: string;
@@ -852,36 +868,130 @@ export async function transactionRoutes(
         const result =
           await client.query(
             `
+            with confirmed_recharges as (
+
+                select
+                    t.id,
+                    t.actor_role,
+                    t.recharge_point_id,
+
+                    /*
+                     * Si existen componentes financieros,
+                     * CASH representa el dinero físico
+                     * realmente recibido.
+                     *
+                     * En una recarga promocional:
+                     *
+                     *   transaction.amount = 700
+                     *   CASH               = 500
+                     *   PROMOTIONAL        = 200
+                     *
+                     * Por tanto caja = 500.
+                     */
+                    case
+
+                      when exists (
+
+                        select 1
+
+                        from
+                          transaction_credit_components
+                            component_exists
+
+                        where
+                          component_exists
+                            .transaction_id =
+                          t.id
+
+                      )
+
+                      then coalesce(
+                        (
+                          select
+                            sum(component.amount)
+
+                          from
+                            transaction_credit_components
+                              component
+
+                          where
+                            component.transaction_id =
+                              t.id
+
+                            and component.fund_type =
+                              'CASH'
+                        ),
+                        0
+                      )
+
+                      /*
+                       * Recarga normal de TAQUILLA.
+                       */
+                      when
+                        t.actor_role = 'RECHARGE'
+
+                      then
+                        t.amount
+
+                      /*
+                       * ADMIN_CREDIT no representa
+                       * entrada física de efectivo.
+                       */
+                      else
+                        0
+
+                    end as cash_received
+
+                from transactions t
+
+                where
+                  t.transaction_type =
+                    'RECHARGE'
+
+                  and t.card_write_status =
+                    'CONFIRMED'
+
+                  and t.confirmed_at
+                    is not null
+
+                  and (
+                    t.confirmed_at at time zone
+                      'America/Mexico_City'
+                  )::date = (
+                    now() at time zone
+                      'America/Mexico_City'
+                  )::date
+            )
+
             select
-                coalesce(sum(amount), 0) as total,
+                coalesce(
+                  sum(cash_received),
+                  0
+                ) as total,
+
                 count(*) as operations,
 
                 coalesce(
-                  sum(amount) filter (
-                    where actor_role = 'ADMIN'
-                  ),
+                  sum(cash_received)
+                    filter (
+                      where
+                        actor_role =
+                          'ADMIN'
+                    ),
                   0
                 ) as admin_total,
 
                 coalesce(
-                  sum(amount) filter (
-                    where recharge_point_id is not null
-                  ),
+                  sum(cash_received)
+                    filter (
+                      where
+                        recharge_point_id
+                          is not null
+                    ),
                   0
                 ) as recharge_points_total
 
-            from transactions
-
-            where transaction_type = 'RECHARGE'
-              and card_write_status = 'CONFIRMED'
-              and confirmed_at is not null
-              and (
-                confirmed_at at time zone
-                  'America/Mexico_City'
-              )::date = (
-                now() at time zone
-                  'America/Mexico_City'
-              )::date
+            from confirmed_recharges
             `
           );
 
@@ -1362,6 +1472,33 @@ export async function transactionRoutes(
    * =====================================================
    * RECHARGE AUTHORIZE
    * =====================================================
+   *
+   * Soporta:
+   *
+   * 1. Recarga normal:
+   *
+   *    amount = 100
+   *
+   *    CREDIT:
+   *      CASH 100
+   *
+   * 2. Recarga promocional:
+   *
+   *    promotionId = UUID
+   *
+   *    Ejemplo:
+   *
+   *      Cliente paga        500
+   *      Bono promocional    200
+   *      Crédito NFC         700
+   *
+   *    CREDIT:
+   *      CASH          500
+   *      PROMOTIONAL   200
+   *
+   * La BD es siempre la fuente de verdad de los
+   * montos de una promoción.
+   * =====================================================
    */
 
   server.post<{
@@ -1376,6 +1513,7 @@ export async function transactionRoutes(
         cardId,
         uid,
         amount,
+        promotionId,
         cardBalance,
         cardCounter,
         deviceCode,
@@ -1404,8 +1542,44 @@ export async function transactionRoutes(
       }
 
       if (
-        !Number.isSafeInteger(amount) ||
-        amount <= 0
+        typeof uid !== "string" ||
+        uid.trim().length === 0
+      ) {
+
+        return reply.status(400).send({
+          error:
+            "INVALID_UID",
+        });
+      }
+
+      if (
+        typeof deviceCode !== "string" ||
+        deviceCode.trim().length === 0
+      ) {
+
+        return reply.status(400).send({
+          error:
+            "INVALID_DEVICE_CODE",
+        });
+      }
+
+      const hasPromotion =
+        typeof promotionId === "string" &&
+        promotionId.trim().length > 0;
+
+      /*
+       * En una recarga normal amount es obligatorio.
+       *
+       * Cuando existe promotionId, amount deja de ser
+       * fuente de verdad. El servidor obtiene los montos
+       * directamente de promotions.
+       */
+      if (
+        !hasPromotion &&
+        (
+          !Number.isSafeInteger(amount) ||
+          Number(amount) <= 0
+        )
       ) {
 
         return reply.status(400).send({
@@ -1435,15 +1609,31 @@ export async function transactionRoutes(
         await client.query("BEGIN");
 
         /*
-         * Idempotencia.
+         * =================================================
+         * IDEMPOTENCIA
+         * =================================================
          */
 
         const previousResult =
           await client.query(
             `
-            select *
-            from transactions
-            where idempotency_key = $1
+            select
+                t.*,
+
+                p.name as promotion_name,
+                p.cash_amount as promotion_cash_amount,
+                p.promotional_amount
+                  as promotion_promotional_amount,
+                p.total_credit_amount
+                  as promotion_total_credit_amount
+
+            from transactions t
+
+            left join promotions p
+                on p.id = t.promotion_id
+
+            where t.idempotency_key = $1
+
             limit 1
             `,
             [
@@ -1460,6 +1650,32 @@ export async function transactionRoutes(
             previousResult.rows[0];
 
           await client.query("COMMIT");
+
+          const duplicatedPromotion =
+            tx.promotion_id !== null
+              ? {
+                  id:
+                    tx.promotion_id,
+
+                  name:
+                    tx.promotion_name,
+
+                  cashAmount:
+                    Number(
+                      tx.promotion_cash_amount
+                    ),
+
+                  promotionalAmount:
+                    Number(
+                      tx.promotion_promotional_amount
+                    ),
+
+                  creditedAmount:
+                    Number(
+                      tx.promotion_total_credit_amount
+                    ),
+                }
+              : null;
 
           return {
             authorized:
@@ -1480,8 +1696,29 @@ export async function transactionRoutes(
             cardId:
               Number(tx.card_id),
 
+            /*
+             * amount continúa siendo el cambio total
+             * de saldo de la NFC.
+             */
             amount:
               Number(tx.amount),
+
+            cashAmount:
+              duplicatedPromotion !== null
+                ? duplicatedPromotion.cashAmount
+                : Number(tx.amount),
+
+            promotionalAmount:
+              duplicatedPromotion !== null
+                ? duplicatedPromotion
+                    .promotionalAmount
+                : 0,
+
+            creditedAmount:
+              Number(tx.amount),
+
+            promotion:
+              duplicatedPromotion,
 
             balanceBefore:
               Number(
@@ -1506,7 +1743,9 @@ export async function transactionRoutes(
         }
 
         /*
-         * Tarjeta CUSTOMER.
+         * =================================================
+         * CUSTOMER
+         * =================================================
          */
 
         const cardResult =
@@ -1520,8 +1759,11 @@ export async function transactionRoutes(
                 balance,
                 transaction_counter,
                 current_activation_id
+
             from cards
+
             where card_id = $1
+
             for update
             `,
             [
@@ -1632,7 +1874,9 @@ export async function transactionRoutes(
         }
 
         /*
-         * Dispositivo.
+         * =================================================
+         * DEVICE
+         * =================================================
          */
 
         const deviceResult =
@@ -1642,13 +1886,17 @@ export async function transactionRoutes(
                 id,
                 device_type,
                 status
+
             from devices
+
             where device_code = $1
+
             limit 1
+
             for update
             `,
             [
-              deviceCode,
+              deviceCode.trim(),
             ]
           );
 
@@ -1692,7 +1940,9 @@ export async function transactionRoutes(
         }
 
         /*
-         * Sesión RECHARGE activa.
+         * =================================================
+         * ACTIVE RECHARGE SESSION
+         * =================================================
          */
 
         const sessionResult =
@@ -1705,12 +1955,14 @@ export async function transactionRoutes(
 
                 rp.recharge_code,
                 rp.name,
-                rp.status as recharge_point_status
+                rp.status
+                  as recharge_point_status
 
             from device_recharge_sessions s
 
             join recharge_points rp
-                on rp.id = s.recharge_point_id
+                on rp.id =
+                   s.recharge_point_id
 
             where s.device_id = $1
               and s.status = 'ACTIVE'
@@ -1754,13 +2006,163 @@ export async function transactionRoutes(
           });
         }
 
+        /*
+         * =================================================
+         * RESOLVER CRÉDITO
+         * =================================================
+         */
+
+        let resolvedPromotion:
+          | {
+              id: string;
+              name: string;
+              cashAmount: number;
+              promotionalAmount: number;
+              creditedAmount: number;
+            }
+          | null =
+            null;
+
+        let cashAmount: number;
+        let promotionalAmount: number;
+        let creditedAmount: number;
+
+        if (hasPromotion) {
+
+          const promotionResult =
+            await client.query(
+              `
+              select
+                  id,
+                  name,
+                  cash_amount,
+                  promotional_amount,
+                  total_credit_amount
+
+              from promotions
+
+              where id = $1
+                and active = true
+
+              limit 1
+              `,
+              [
+                promotionId!.trim(),
+              ]
+            );
+
+          if (
+            promotionResult.rowCount === 0
+          ) {
+
+            await client.query("ROLLBACK");
+
+            return reply.status(404).send({
+              error:
+                "PROMOTION_NOT_FOUND_OR_INACTIVE",
+            });
+          }
+
+          const promotion =
+            promotionResult.rows[0];
+
+          cashAmount =
+            Number(
+              promotion.cash_amount
+            );
+
+          promotionalAmount =
+            Number(
+              promotion.promotional_amount
+            );
+
+          creditedAmount =
+            Number(
+              promotion.total_credit_amount
+            );
+
+          if (
+            !Number.isSafeInteger(cashAmount) ||
+            cashAmount <= 0 ||
+            !Number.isSafeInteger(
+              promotionalAmount
+            ) ||
+            promotionalAmount <= 0 ||
+            !Number.isSafeInteger(
+              creditedAmount
+            ) ||
+            creditedAmount <= 0 ||
+            creditedAmount !==
+              cashAmount +
+                promotionalAmount
+          ) {
+
+            await client.query("ROLLBACK");
+
+            return reply.status(409).send({
+              error:
+                "INVALID_PROMOTION_CONFIGURATION",
+            });
+          }
+
+          resolvedPromotion = {
+            id:
+              promotion.id,
+
+            name:
+              promotion.name,
+
+            cashAmount,
+
+            promotionalAmount,
+
+            creditedAmount,
+          };
+
+        } else {
+
+          cashAmount =
+            Number(amount);
+
+          promotionalAmount =
+            0;
+
+          creditedAmount =
+            Number(amount);
+        }
+
+        /*
+         * Éste es el monto que realmente debe escribirse
+         * en la tarjeta.
+         *
+         * Promoción 500 + 200:
+         *
+         *     balance += 700
+         */
         const balanceAfter =
           serverBalance +
-          amount;
+          creditedAmount;
 
         const counterAfter =
           serverCounter +
           1;
+
+        /*
+         * =================================================
+         * TRANSACTION
+         * =================================================
+         *
+         * transactions.amount representa el cambio total
+         * del saldo NFC.
+         *
+         * Para una promoción 500 + 200:
+         *
+         *     amount = 700
+         *
+         * El desglose real se guarda posteriormente en
+         * transaction_credit_components.
+         * =================================================
+         */
 
         const transactionResult =
           await client.query(
@@ -1781,8 +2183,10 @@ export async function transactionRoutes(
                 actor_card_id,
                 activation_id,
                 ledger_action,
-                credit_fund_type
+                credit_fund_type,
+                promotion_id
             )
+
             values (
                 $1,
                 $2,
@@ -1799,15 +2203,17 @@ export async function transactionRoutes(
                 $10,
                 $11,
                 'CREDIT',
-                'CASH'
+                'CASH',
+                $12
             )
+
             returning *
             `,
             [
               idempotencyKey,
               cardId,
               device.id,
-              amount,
+              creditedAmount,
               serverBalance,
               balanceAfter,
               serverCounter,
@@ -1818,13 +2224,67 @@ export async function transactionRoutes(
                 .opened_by_card_id,
               card
                 .current_activation_id,
+              resolvedPromotion?.id ??
+                null,
             ]
           );
 
-        await client.query("COMMIT");
-
         const transaction =
           transactionResult.rows[0];
+
+        /*
+         * =================================================
+         * PROMOTIONAL CREDIT COMPONENTS
+         * =================================================
+         *
+         * Recargas normales no necesitan componentes:
+         *
+         *   credit_fund_type = CASH
+         *
+         * Promociones sí:
+         *
+         *   CASH          500
+         *   PROMOTIONAL   200
+         * =================================================
+         */
+
+        if (
+          resolvedPromotion !== null
+        ) {
+
+          await client.query(
+            `
+            insert into
+              transaction_credit_components (
+                transaction_id,
+                fund_type,
+                amount,
+                promotion_id
+              )
+
+            values (
+                $1,
+                'CASH',
+                $2,
+                $4
+            ),
+            (
+                $1,
+                'PROMOTIONAL',
+                $3,
+                $4
+            )
+            `,
+            [
+              transaction.id,
+              cashAmount,
+              promotionalAmount,
+              resolvedPromotion.id,
+            ]
+          );
+        }
+
+        await client.query("COMMIT");
 
         return {
           authorized:
@@ -1850,7 +2310,26 @@ export async function transactionRoutes(
               rechargeSession.name,
           },
 
-          amount,
+          /*
+           * Compatibilidad.
+           *
+           * amount sigue representando cuánto se
+           * acreditó a la tarjeta.
+           */
+          amount:
+            creditedAmount,
+
+          /*
+           * Información financiera detallada.
+           */
+          cashAmount,
+
+          promotionalAmount,
+
+          creditedAmount,
+
+          promotion:
+            resolvedPromotion,
 
           balanceBefore:
             serverBalance,
@@ -1867,6 +2346,26 @@ export async function transactionRoutes(
 
         await client.query("ROLLBACK");
 
+        /*
+         * UUID inválido para promotionId.
+         */
+        if (
+          error?.code ===
+          "22P02"
+        ) {
+
+          return reply.status(400).send({
+            error:
+              "INVALID_PROMOTION_ID",
+          });
+        }
+
+        /*
+         * Restricción UNIQUE.
+         *
+         * Normalmente significa que otra operación
+         * quedó abierta sobre esta CUSTOMER.
+         */
         if (
           error?.code ===
           "23505"
