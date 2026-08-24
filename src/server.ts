@@ -46,6 +46,10 @@ import {
 } from "./routes/rechargeManagement.js";
 
 import {
+  promotionManagementRoutes,
+} from "./routes/promotionManagement.js";
+
+import {
   adminCardManagementRoutes,
 } from "./routes/adminCardManagement.js";
 
@@ -186,6 +190,7 @@ async function start() {
 
     await server.register(
       fastifyStatic,
+
       {
         root:
           join(
@@ -207,6 +212,7 @@ async function start() {
 
     await server.register(
       multipart,
+
       {
         limits: {
           files:
@@ -309,7 +315,18 @@ async function start() {
 
     /*
      * =====================================================
-     * GESTIÓN DE TARJETAS
+     * GESTIÓN DE PROMOCIONES
+     * =====================================================
+     */
+
+    await server.register(
+      promotionManagementRoutes
+    );
+
+
+    /*
+     * =====================================================
+     * GESTIÓN DE TARJETAS GAME / RECHARGE / ADMIN
      * =====================================================
      */
 
@@ -320,7 +337,13 @@ async function start() {
 
     /*
      * =====================================================
-     * GESTIÓN DE DISPOSITIVOS DESDE ADMIN ANDROID
+     * GESTIÓN DE DISPOSITIVOS DESDE ADMIN
+     *
+     * - listar;
+     * - registrar Ulefone;
+     * - activar/bloquear;
+     * - generar código de provisionamiento;
+     * - revocar código.
      * =====================================================
      */
 
@@ -332,6 +355,8 @@ async function start() {
     /*
      * =====================================================
      * PROVISIONAMIENTO DEL ULEFONE
+     *
+     * Utilizado por dispositivos todavía no configurados.
      * =====================================================
      */
 
@@ -372,6 +397,12 @@ async function start() {
       publicFairRoutes
     );
 
+
+    /*
+     * =====================================================
+     * CONTENIDO PÚBLICO
+     * =====================================================
+     */
 
     await server.register(
       publicContentRoutes
