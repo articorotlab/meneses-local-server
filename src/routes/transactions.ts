@@ -291,7 +291,10 @@ export async function transactionRoutes(
                 status,
                 balance,
                 transaction_counter,
-                current_activation_id
+                current_activation_id,
+                financial_hold,
+                financial_hold_reason,
+                financial_hold_at
             from cards
             where card_id = $1
             for update
@@ -332,6 +335,20 @@ export async function transactionRoutes(
           await client.query("ROLLBACK");
           return reply.status(409).send({
             error: "CARD_NOT_ACTIVE",
+          });
+        }
+
+        if (card.financial_hold === true) {
+          await client.query("ROLLBACK");
+          return reply.status(409).send({
+            error: "CARD_FINANCIAL_HOLD",
+            reason:
+              card.financial_hold_reason ??
+              "MANUAL_REVIEW_REQUIRED",
+            heldAt:
+              card.financial_hold_at,
+            message:
+              "La tarjeta está en revisión manual y no puede realizar operaciones financieras.",
           });
         }
 
@@ -636,7 +653,10 @@ export async function transactionRoutes(
                 card_type,
                 status,
                 balance,
-                transaction_counter
+                transaction_counter,
+                financial_hold,
+                financial_hold_reason,
+                financial_hold_at
             from cards
             where card_id = $1
             for update
@@ -677,6 +697,20 @@ export async function transactionRoutes(
           await client.query("ROLLBACK");
           return reply.status(409).send({
             error: "CARD_NOT_ACTIVE",
+          });
+        }
+
+        if (card.financial_hold === true) {
+          await client.query("ROLLBACK");
+          return reply.status(409).send({
+            error: "CARD_FINANCIAL_HOLD",
+            reason:
+              card.financial_hold_reason ??
+              "MANUAL_REVIEW_REQUIRED",
+            heldAt:
+              card.financial_hold_at,
+            message:
+              "La tarjeta está en revisión manual y no puede realizar operaciones financieras.",
           });
         }
 
@@ -1111,7 +1145,11 @@ export async function transactionRoutes(
                 card_id,
                 uid,
                 balance,
-                transaction_counter
+                transaction_counter,
+                current_activation_id,
+                financial_hold,
+                financial_hold_reason,
+                financial_hold_at
             from cards
             where card_id = $1
             for update
@@ -1391,7 +1429,115 @@ export async function transactionRoutes(
 
         /*
          * Estado desconocido.
+         *
+         * La NFC no coincide ni con BEFORE ni con AFTER.
+         * No se intenta corregir ningún saldo automáticamente.
+         *
+         * Se conserva una fotografía forense de:
+         *   - NFC
+         *   - cards (PostgreSQL)
+         *   - Financial Ledger V2
+         *   - BEFORE / AFTER esperados
+         *
+         * y la tarjeta queda en cuarentena.
          */
+
+        const ledgerResult =
+          await client.query(
+            `
+            select
+                coalesce(
+                  sum(cfl.remaining_amount),
+                  0
+                ) as ledger_balance
+            from card_fund_lots cfl
+            where cfl.card_id = $1
+              and cfl.activation_id = $2
+            `,
+            [
+              cardId,
+              card.current_activation_id,
+            ]
+          );
+
+        const ledgerBalance =
+          Number(
+            ledgerResult.rows[0]
+              .ledger_balance
+          );
+
+        await client.query(
+          `
+          insert into card_financial_incidents (
+              card_id,
+              activation_id,
+              transaction_id,
+              incident_type,
+              device_code,
+              nfc_balance,
+              nfc_counter,
+              server_balance,
+              server_counter,
+              ledger_balance,
+              expected_before_balance,
+              expected_before_counter,
+              expected_after_balance,
+              expected_after_counter,
+              transaction_type,
+              transaction_amount,
+              promotion_id,
+              transaction_status_before,
+              failure_reason
+          )
+          values (
+              $1,
+              $2,
+              $3,
+              'MANUAL_REVIEW_REQUIRED',
+              (
+                select d.device_code
+                from devices d
+                where d.id = $4
+                limit 1
+              ),
+              $5,
+              $6,
+              $7,
+              $8,
+              $9,
+              $10,
+              $11,
+              $12,
+              $13,
+              $14,
+              $15,
+              $16,
+              $17,
+              'Reconciliación: estado físico inesperado.'
+          )
+          on conflict (transaction_id)
+          do nothing
+          `,
+          [
+            cardId,
+            card.current_activation_id,
+            transaction.id,
+            transaction.device_id,
+            cardBalance,
+            cardCounter,
+            serverBalance,
+            serverCounter,
+            ledgerBalance,
+            balanceBefore,
+            counterBefore,
+            balanceAfter,
+            counterAfter,
+            transaction.transaction_type,
+            Number(transaction.amount),
+            transaction.promotion_id,
+            transaction.card_write_status,
+          ]
+        );
 
         await client.query(
           `
@@ -1409,6 +1555,26 @@ export async function transactionRoutes(
           ]
         );
 
+        await client.query(
+          `
+          update cards
+          set
+              financial_hold = true,
+              financial_hold_reason =
+                'MANUAL_REVIEW_REQUIRED',
+              financial_hold_at =
+                coalesce(
+                  financial_hold_at,
+                  now()
+                ),
+              updated_at = now()
+          where card_id = $1
+          `,
+          [
+            cardId,
+          ]
+        );
+
         await client.query("COMMIT");
 
         return reply.status(409).send({
@@ -1418,12 +1584,20 @@ export async function transactionRoutes(
           transactionId:
             transaction.id,
 
+          financialHold:
+            true,
+
           serverState: {
             balance:
               serverBalance,
 
             transactionCounter:
               serverCounter,
+          },
+
+          ledgerState: {
+            balance:
+              ledgerBalance,
           },
 
           expectedBefore: {
@@ -1448,6 +1622,20 @@ export async function transactionRoutes(
 
             transactionCounter:
               cardCounter,
+          },
+
+          differences: {
+            nfcVsPostgreSQL:
+              cardBalance -
+              serverBalance,
+
+            nfcVsLedger:
+              cardBalance -
+              ledgerBalance,
+
+            postgreSQLVsLedger:
+              serverBalance -
+              ledgerBalance,
           },
         });
 
@@ -1758,7 +1946,10 @@ export async function transactionRoutes(
                 status,
                 balance,
                 transaction_counter,
-                current_activation_id
+                current_activation_id,
+                financial_hold,
+                financial_hold_reason,
+                financial_hold_at
 
             from cards
 
@@ -1820,6 +2011,26 @@ export async function transactionRoutes(
           return reply.status(409).send({
             error:
               "CARD_NOT_ACTIVE",
+          });
+        }
+
+        if (card.financial_hold === true) {
+
+          await client.query("ROLLBACK");
+
+          return reply.status(409).send({
+            error:
+              "CARD_FINANCIAL_HOLD",
+
+            reason:
+              card.financial_hold_reason ??
+              "MANUAL_REVIEW_REQUIRED",
+
+            heldAt:
+              card.financial_hold_at,
+
+            message:
+              "La tarjeta está en revisión manual y no puede realizar operaciones financieras.",
           });
         }
 
@@ -2566,7 +2777,10 @@ export async function transactionRoutes(
                 status,
                 balance,
                 transaction_counter,
-                current_activation_id
+                current_activation_id,
+                financial_hold,
+                financial_hold_reason,
+                financial_hold_at
             from cards
             where card_id = $1
             for update
@@ -2625,6 +2839,26 @@ export async function transactionRoutes(
           return reply.status(409).send({
             error:
               "CARD_NOT_ACTIVE",
+          });
+        }
+
+        if (card.financial_hold === true) {
+
+          await client.query("ROLLBACK");
+
+          return reply.status(409).send({
+            error:
+              "CARD_FINANCIAL_HOLD",
+
+            reason:
+              card.financial_hold_reason ??
+              "MANUAL_REVIEW_REQUIRED",
+
+            heldAt:
+              card.financial_hold_at,
+
+            message:
+              "La tarjeta está en revisión manual y no puede realizar operaciones financieras.",
           });
         }
 

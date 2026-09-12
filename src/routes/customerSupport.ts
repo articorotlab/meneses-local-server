@@ -13,6 +13,35 @@ type CardHistoryBody = {
   deviceCode: string;
 };
 
+
+type CardReturnAuthorizeBody = {
+  idempotencyKey: string;
+  cardId: number;
+  uid: string;
+  deviceCode: string;
+};
+
+
+type CardReturnConfirmBody = {
+  operationId: string;
+  cardId: number;
+  uid: string;
+  deviceCode: string;
+
+  writtenCardId: number;
+  writtenCardType: string;
+  writtenStatus: string;
+  writtenBalance: number;
+  writtenTransactionCounter: number;
+};
+
+
+type CardReturnFailBody = {
+  operationId: string;
+  deviceCode: string;
+  reason?: string;
+};
+
 /*
  * =========================================================
  * CUSTOMER SUPPORT ROUTES
@@ -308,6 +337,10 @@ export async function customerSupportRoutes(
               status,
               balance,
               transaction_counter,
+              current_activation_id,
+              financial_hold,
+              financial_hold_reason,
+              financial_hold_at,
               created_at,
               updated_at
 
@@ -358,6 +391,86 @@ export async function customerSupportRoutes(
           error: "CARD_NOT_CUSTOMER",
           message:
             "El historial de atención al cliente solo está disponible para tarjetas CUSTOMER.",
+        });
+      }
+
+
+      /*
+       * Una tarjeta física puede reutilizarse.
+       *
+       * El historial operativo SIEMPRE pertenece a la
+       * activación actual, nunca a todo el card_id.
+       */
+      if (
+        card.current_activation_id ===
+        null
+      ) {
+
+        return reply.status(409).send({
+          error:
+            "CARD_HAS_NO_ACTIVE_ACTIVATION",
+
+          message:
+            "La tarjeta no tiene una activación CUSTOMER activa.",
+        });
+      }
+
+
+      const activationResult =
+        await db.query(
+          `
+          select
+              id,
+              activation_number,
+              activation_fee,
+              activation_fee_known,
+              status,
+              started_at
+
+          from customer_card_activations
+
+          where id = $1
+            and card_id = $2
+
+          limit 1
+          `,
+          [
+            card.current_activation_id,
+            cardId,
+          ]
+        );
+
+
+      if (
+        activationResult.rowCount ===
+        0
+      ) {
+
+        return reply.status(409).send({
+          error:
+            "CURRENT_ACTIVATION_NOT_FOUND",
+
+          message:
+            "No fue posible localizar la activación actual de la tarjeta.",
+        });
+      }
+
+
+      const activation =
+        activationResult.rows[0];
+
+
+      if (
+        activation.status !==
+        "ACTIVE"
+      ) {
+
+        return reply.status(409).send({
+          error:
+            "CURRENT_ACTIVATION_NOT_ACTIVE",
+
+          message:
+            "La activación actual de la tarjeta no está activa.",
         });
       }
 
@@ -421,6 +534,8 @@ export async function customerSupportRoutes(
               on rp.id = t.recharge_point_id
 
           where t.card_id = $1
+            and t.activation_id = $2
+            and t.card_write_status = 'CONFIRMED'
 
           order by t.created_at desc
 
@@ -428,6 +543,7 @@ export async function customerSupportRoutes(
           `,
           [
             cardId,
+            card.current_activation_id,
           ]
         );
 
@@ -545,6 +661,158 @@ export async function customerSupportRoutes(
 
       /*
        * =================================================
+       * INCIDENTES FINANCIEROS / SNAPSHOT FORENSE
+       * =================================================
+       *
+       * Visible únicamente aquí, porque esta ruta ya exige
+       * sesión ADMIN o RECHARGE / TAQUILLA.
+       */
+
+      const incidentResult =
+        await db.query(
+          `
+          select
+              i.id,
+              i.transaction_id,
+              i.detected_at,
+              i.incident_type,
+              i.device_code,
+
+              i.nfc_balance,
+              i.nfc_counter,
+
+              i.server_balance,
+              i.server_counter,
+
+              i.ledger_balance,
+
+              i.expected_before_balance,
+              i.expected_before_counter,
+
+              i.expected_after_balance,
+              i.expected_after_counter,
+
+              i.transaction_type,
+              i.transaction_amount,
+              i.promotion_id,
+              i.transaction_status_before,
+              i.failure_reason
+
+          from card_financial_incidents i
+
+          where i.card_id = $1
+            and i.activation_id = $2
+
+          order by i.detected_at desc
+          `,
+          [
+            cardId,
+            card.current_activation_id,
+          ]
+        );
+
+
+      const financialIncidents =
+        incidentResult.rows.map(
+          (row) => ({
+            incidentId:
+              row.id,
+
+            type:
+              row.incident_type,
+
+            detectedAt:
+              row.detected_at,
+
+            transactionId:
+              row.transaction_id,
+
+            deviceCode:
+              row.device_code,
+
+            transaction: {
+              type:
+                row.transaction_type,
+
+              amount:
+                row.transaction_amount !== null
+                  ? Number(row.transaction_amount)
+                  : null,
+
+              promotionId:
+                row.promotion_id,
+
+              statusBefore:
+                row.transaction_status_before,
+            },
+
+            nfc: {
+              balance:
+                Number(row.nfc_balance),
+
+              transactionCounter:
+                Number(row.nfc_counter),
+            },
+
+            postgreSQL: {
+              balance:
+                Number(row.server_balance),
+
+              transactionCounter:
+                Number(row.server_counter),
+            },
+
+            ledger: {
+              balance:
+                Number(row.ledger_balance),
+            },
+
+            expectedBefore: {
+              balance:
+                Number(
+                  row.expected_before_balance
+                ),
+
+              transactionCounter:
+                Number(
+                  row.expected_before_counter
+                ),
+            },
+
+            expectedAfter: {
+              balance:
+                Number(
+                  row.expected_after_balance
+                ),
+
+              transactionCounter:
+                Number(
+                  row.expected_after_counter
+                ),
+            },
+
+            differences: {
+              nfcVsPostgreSQL:
+                Number(row.nfc_balance) -
+                Number(row.server_balance),
+
+              nfcVsLedger:
+                Number(row.nfc_balance) -
+                Number(row.ledger_balance),
+
+              postgreSQLVsLedger:
+                Number(row.server_balance) -
+                Number(row.ledger_balance),
+            },
+
+            failureReason:
+              row.failure_reason,
+          })
+        );
+
+
+      /*
+       * =================================================
        * RESPONSE
        * =================================================
        */
@@ -584,6 +852,47 @@ export async function customerSupportRoutes(
 
           updatedAt:
             card.updated_at,
+
+          financialHold: {
+            active:
+              Boolean(
+                card.financial_hold
+              ),
+
+            reason:
+              card.financial_hold_reason,
+
+            heldAt:
+              card.financial_hold_at,
+          },
+        },
+
+        financialIncidentsCount:
+          financialIncidents.length,
+
+        financialIncidents,
+
+        activation: {
+          activationId:
+            activation.id,
+
+          activationNumber:
+            Number(
+              activation.activation_number
+            ),
+
+          activationFee:
+            Number(
+              activation.activation_fee
+            ),
+
+          activationFeeKnown:
+            Boolean(
+              activation.activation_fee_known
+            ),
+
+          startedAt:
+            activation.started_at,
         },
 
         historyCount:
@@ -593,4 +902,1580 @@ export async function customerSupportRoutes(
       };
     }
   );
+
+
+  /*
+   * =====================================================
+   * AUTORIZAR DEVOLUCIÓN / RESET DE CUSTOMER
+   * =====================================================
+   *
+   * POST /customer-support/card-return/authorize
+   *
+   * NO modifica todavía la tarjeta ni el ledger.
+   * Solamente calcula y congela:
+   *
+   * - reembolso de activación;
+   * - CASH restante;
+   * - PROMOTIONAL restante;
+   * - ADMIN_CREDIT restante;
+   * - LEGACY restante.
+   * =====================================================
+   */
+
+  server.post<{
+    Body:
+      CardReturnAuthorizeBody;
+  }>(
+    "/customer-support/card-return/authorize",
+
+    async (
+      request,
+      reply
+    ) => {
+
+      const {
+        idempotencyKey,
+        cardId,
+        uid,
+        deviceCode,
+      } =
+        request.body;
+
+
+      if (
+        typeof idempotencyKey !==
+          "string" ||
+        idempotencyKey
+          .trim()
+          .length ===
+          0
+      ) {
+
+        return reply
+          .status(400)
+          .send({
+            error:
+              "INVALID_IDEMPOTENCY_KEY",
+          });
+      }
+
+
+      if (
+        !Number.isSafeInteger(
+          cardId
+        ) ||
+        cardId <=
+          0
+      ) {
+
+        return reply
+          .status(400)
+          .send({
+            error:
+              "INVALID_CARD_ID",
+
+            message:
+              "Card ID inválido.",
+          });
+      }
+
+
+      if (
+        typeof uid !==
+          "string" ||
+        uid
+          .trim()
+          .length ===
+          0
+      ) {
+
+        return reply
+          .status(400)
+          .send({
+            error:
+              "INVALID_UID",
+          });
+      }
+
+
+      if (
+        typeof deviceCode !==
+          "string" ||
+        deviceCode
+          .trim()
+          .length ===
+          0
+      ) {
+
+        return reply
+          .status(400)
+          .send({
+            error:
+              "INVALID_DEVICE_CODE",
+          });
+      }
+
+
+      const normalizedUid =
+        uid
+          .trim()
+          .toUpperCase();
+
+
+      const normalizedDeviceCode =
+        deviceCode.trim();
+
+
+      const client =
+        await db.connect();
+
+
+      try {
+
+        await client.query(
+          "BEGIN"
+        );
+
+
+        const deviceResult =
+          await client.query(
+            `
+            select
+                id,
+                status
+
+            from devices
+
+            where device_code = $1
+
+            limit 1
+
+            for update
+            `,
+            [
+              normalizedDeviceCode,
+            ]
+          );
+
+
+        if (
+          deviceResult.rowCount ===
+          0
+        ) {
+
+          await client.query(
+            "ROLLBACK"
+          );
+
+
+          return reply
+            .status(404)
+            .send({
+              error:
+                "DEVICE_NOT_FOUND",
+            });
+        }
+
+
+        const device =
+          deviceResult.rows[0];
+
+
+        if (
+          device.status !==
+          "ACTIVE"
+        ) {
+
+          await client.query(
+            "ROLLBACK"
+          );
+
+
+          return reply
+            .status(409)
+            .send({
+              error:
+                "DEVICE_NOT_ACTIVE",
+            });
+        }
+
+
+        /*
+         * ADMIN tiene prioridad si ambas sesiones
+         * existieran accidentalmente.
+         */
+        const adminResult =
+          await client.query(
+            `
+            select
+                id,
+                admin_card_id
+
+            from device_admin_sessions
+
+            where device_id = $1
+
+              and status =
+                  'ACTIVE'
+
+              and ended_at
+                  is null
+
+            limit 1
+
+            for update
+            `,
+            [
+              device.id,
+            ]
+          );
+
+
+        const rechargeResult =
+          await client.query(
+            `
+            select
+                s.id,
+                s.opened_by_card_id,
+                s.recharge_point_id,
+
+                rp.recharge_code,
+                rp.name
+                  as recharge_point_name
+
+            from device_recharge_sessions s
+
+            join recharge_points rp
+                on rp.id =
+                   s.recharge_point_id
+
+            where s.device_id = $1
+
+              and s.status =
+                  'ACTIVE'
+
+              and s.ended_at
+                  is null
+
+            limit 1
+
+            for update of s
+            `,
+            [
+              device.id,
+            ]
+          );
+
+
+        let returnedByRole:
+          "ADMIN" |
+          "RECHARGE";
+
+
+        let returnedByCardId:
+          number;
+
+
+        let rechargePointId:
+          string | null =
+            null;
+
+
+        let rechargePoint:
+          {
+            code: string;
+            name: string;
+          } | null =
+            null;
+
+
+        if (
+          adminResult.rowCount &&
+          adminResult.rowCount >
+            0
+        ) {
+
+          returnedByRole =
+            "ADMIN";
+
+
+          returnedByCardId =
+            Number(
+              adminResult
+                .rows[0]
+                .admin_card_id
+            );
+
+
+        } else if (
+          rechargeResult.rowCount &&
+          rechargeResult.rowCount >
+            0
+        ) {
+
+          const session =
+            rechargeResult
+              .rows[0];
+
+
+          if (
+            session
+              .opened_by_card_id ===
+            null
+          ) {
+
+            await client.query(
+              "ROLLBACK"
+            );
+
+
+            return reply
+              .status(409)
+              .send({
+                error:
+                  "RECHARGE_SESSION_HAS_NO_CARD",
+              });
+          }
+
+
+          returnedByRole =
+            "RECHARGE";
+
+
+          returnedByCardId =
+            Number(
+              session
+                .opened_by_card_id
+            );
+
+
+          rechargePointId =
+            session
+              .recharge_point_id;
+
+
+          rechargePoint = {
+            code:
+              session
+                .recharge_code,
+
+            name:
+              session
+                .recharge_point_name,
+          };
+
+
+        } else {
+
+          await client.query(
+            "ROLLBACK"
+          );
+
+
+          return reply
+            .status(403)
+            .send({
+              error:
+                "CUSTOMER_RETURN_PERMISSION_REQUIRED",
+
+              message:
+                "Se necesita una sesión ADMIN o RECHARGE activa para devolver una CUSTOMER.",
+            });
+        }
+
+
+        /*
+         * Una tarjeta en cuarentena no puede devolverse/resetearse.
+         * El historial y el diagnóstico siguen disponibles.
+         */
+        const holdResult =
+          await client.query(
+            `
+            select
+                financial_hold,
+                financial_hold_reason,
+                financial_hold_at
+
+            from cards
+
+            where card_id = $1
+
+            limit 1
+
+            for update
+            `,
+            [
+              cardId,
+            ]
+          );
+
+
+        if (
+          holdResult.rowCount &&
+          holdResult.rowCount > 0 &&
+          holdResult.rows[0]
+            .financial_hold === true
+        ) {
+
+          await client.query(
+            "ROLLBACK"
+          );
+
+
+          return reply
+            .status(409)
+            .send({
+              error:
+                "CARD_FINANCIAL_HOLD",
+
+              reason:
+                holdResult.rows[0]
+                  .financial_hold_reason ??
+                "MANUAL_REVIEW_REQUIRED",
+
+              heldAt:
+                holdResult.rows[0]
+                  .financial_hold_at,
+
+              message:
+                "La tarjeta está en revisión manual y no puede devolverse ni reutilizarse.",
+            });
+        }
+
+
+        const result =
+          await client.query(
+            `
+            select *
+
+            from financial_authorize_card_return(
+              $1,
+              $2,
+              $3,
+              $4,
+              $5,
+              $6,
+              $7
+            )
+            `,
+            [
+              idempotencyKey.trim(),
+              device.id,
+              cardId,
+              normalizedUid,
+              returnedByRole,
+              returnedByCardId,
+              rechargePointId,
+            ]
+          );
+
+
+        const row =
+          result.rows[0];
+
+
+        /*
+         * =================================================
+         * ORIGEN DE LA ACTIVACIÓN / POLÍTICA DE REEMBOLSO
+         * =================================================
+         *
+         * No inferimos el origen únicamente a partir de
+         * refundAmount = 0.
+         *
+         * Una activación creada por ADMIN puede resetearse,
+         * pero no debe generar devolución de efectivo.
+         */
+        const activationOriginResult =
+          await client.query(
+            `
+              select
+                activated_by_role,
+                activation_fee,
+                activation_fee_known
+
+              from customer_card_activations
+
+              where id = $1
+                and card_id = $2
+
+              limit 1
+            `,
+            [
+              row.activation_id,
+              cardId,
+            ]
+          );
+
+
+        if (
+          activationOriginResult.rowCount ===
+          0
+        ) {
+
+          throw new Error(
+            "ACTIVATION_NOT_FOUND_AFTER_RETURN_AUTHORIZATION"
+          );
+        }
+
+
+        const activationOrigin =
+          activationOriginResult.rows[0];
+
+
+        const activatedByRole =
+          String(
+            activationOrigin
+              .activated_by_role
+          );
+
+
+        const activationFeeKnown =
+          Boolean(
+            activationOrigin
+              .activation_fee_known
+          );
+
+
+        const refundAmount =
+          Number(
+            row.refund_amount
+          );
+
+
+        const adminCreatedWithoutRefund =
+          activatedByRole ===
+            "ADMIN" &&
+          !activationFeeKnown;
+
+
+        const refundPolicy =
+          adminCreatedWithoutRefund
+            ? {
+                shouldRefundMoney:
+                  false,
+
+                reason:
+                  "ADMIN_CREATED",
+
+                message:
+                  "NO DEVOLVER DINERO. Esta tarjeta fue creada por ADMIN y no tiene depósito de activación reembolsable.",
+              }
+            : {
+                shouldRefundMoney:
+                  refundAmount > 0,
+
+                reason:
+                  activationFeeKnown
+                    ? "ACTIVATION_FEE"
+                    : "NO_REFUND",
+
+                message:
+                  refundAmount > 0
+                    ? `Devolver $${refundAmount.toFixed(2)} al cliente.`
+                    : "No hay dinero de activación que devolver.",
+              };
+
+
+        await client.query(
+          "COMMIT"
+        );
+
+
+        return {
+          authorized:
+            true,
+
+          duplicated:
+            Boolean(
+              row.duplicated
+            ),
+
+          operationId:
+            row.operation_id,
+
+          requester: {
+            role:
+              returnedByRole,
+
+            cardId:
+              returnedByCardId,
+
+            rechargePoint,
+          },
+
+          card: {
+            cardId:
+              Number(
+                row.card_id
+              ),
+
+            uid:
+              row.uid,
+
+            type:
+              "CUSTOMER",
+
+            activationId:
+              row.activation_id,
+
+            balanceBefore:
+              Number(
+                row.balance_before
+              ),
+
+            transactionCounterBefore:
+              Number(
+                row.counter_before
+              ),
+          },
+
+          activation: {
+            activationId:
+              row.activation_id,
+
+            activatedByRole,
+
+            activationFee:
+              Number(
+                activationOrigin
+                  .activation_fee
+              ),
+
+            activationFeeKnown,
+          },
+
+          refundAmount,
+
+          refundPolicy,
+
+          discarded: {
+            cash:
+              Number(
+                row.discarded_cash
+              ),
+
+            promotional:
+              Number(
+                row.discarded_promotional
+              ),
+
+            adminCredit:
+              Number(
+                row.discarded_admin_credit
+              ),
+
+            legacy:
+              Number(
+                row.discarded_legacy
+              ),
+
+            total:
+              Number(
+                row.discarded_cash
+              ) +
+              Number(
+                row.discarded_promotional
+              ) +
+              Number(
+                row.discarded_admin_credit
+              ) +
+              Number(
+                row.discarded_legacy
+              ),
+          },
+
+          /*
+           * Estado que Android debe escribir y posteriormente
+           * verificar físicamente antes de CONFIRM.
+           */
+          targetState: {
+            cardId:
+              Number(
+                row.card_id
+              ),
+
+            uid:
+              row.uid,
+
+            cardType:
+              "CUSTOMER",
+
+            status:
+              "INACTIVE",
+
+            balance:
+              0,
+
+            transactionCounter:
+              0,
+          },
+        };
+
+
+      } catch (
+        error: any
+      ) {
+
+        await client.query(
+          "ROLLBACK"
+        );
+
+
+        const message =
+          typeof error?.message ===
+          "string"
+            ? error.message
+            : "INTERNAL_ERROR";
+
+
+        if (
+          message.includes(
+            "ACTIVATION_FEE_UNKNOWN"
+          )
+        ) {
+
+          return reply
+            .status(409)
+            .send({
+              error:
+                "ACTIVATION_FEE_UNKNOWN",
+
+              message:
+                "No conocemos con certeza cuánto pagó el cliente por esta activación. La devolución automática requiere revisión ADMIN.",
+            });
+        }
+
+
+        if (
+          message.includes(
+            "CARD_RETURN_LEDGER_MISMATCH"
+          )
+        ) {
+
+          return reply
+            .status(409)
+            .send({
+              error:
+                "CARD_RETURN_LEDGER_MISMATCH",
+
+              message:
+                "El saldo de la tarjeta no coincide con Financial Ledger V2. No se autorizó la devolución.",
+            });
+        }
+
+
+        const knownConflictErrors = [
+          "CARD_NOT_FOUND",
+          "CARD_NOT_CUSTOMER",
+          "UID_MISMATCH",
+          "CARD_NOT_ACTIVE",
+          "CARD_HAS_NO_ACTIVE_ACTIVATION",
+          "ACTIVATION_NOT_FOUND",
+          "ACTIVATION_CARD_MISMATCH",
+          "ACTIVATION_NOT_ACTIVE",
+          "ACTIVATION_NOT_FOUND_AFTER_RETURN_AUTHORIZATION",
+        ];
+
+
+        const knownError =
+          knownConflictErrors.find(
+            (code) =>
+              message.includes(
+                code
+              )
+          );
+
+
+        if (
+          knownError
+        ) {
+
+          return reply
+            .status(409)
+            .send({
+              error:
+                knownError,
+            });
+        }
+
+
+        server.log.error(
+          error
+        );
+
+
+        return reply
+          .status(500)
+          .send({
+            error:
+              "INTERNAL_ERROR",
+          });
+
+
+      } finally {
+
+        client.release();
+      }
+    }
+  );
+
+
+  /*
+   * =====================================================
+   * CONFIRMAR DEVOLUCIÓN / RESET
+   * =====================================================
+   *
+   * POST /customer-support/card-return/confirm
+   *
+   * Android debe llamar este endpoint únicamente después
+   * de escribir y releer la tarjeta física.
+   * =====================================================
+   */
+
+  server.post<{
+    Body:
+      CardReturnConfirmBody;
+  }>(
+    "/customer-support/card-return/confirm",
+
+    async (
+      request,
+      reply
+    ) => {
+
+      const {
+        operationId,
+        cardId,
+        uid,
+        deviceCode,
+
+        writtenCardId,
+        writtenCardType,
+        writtenStatus,
+        writtenBalance,
+        writtenTransactionCounter,
+      } =
+        request.body;
+
+
+      if (
+        typeof operationId !==
+          "string" ||
+        operationId
+          .trim()
+          .length ===
+          0
+      ) {
+
+        return reply
+          .status(400)
+          .send({
+            error:
+              "INVALID_OPERATION_ID",
+          });
+      }
+
+
+      if (
+        !Number.isSafeInteger(
+          cardId
+        ) ||
+        cardId <=
+          0 ||
+        typeof uid !==
+          "string" ||
+        uid
+          .trim()
+          .length ===
+          0 ||
+        typeof deviceCode !==
+          "string" ||
+        deviceCode
+          .trim()
+          .length ===
+          0
+      ) {
+
+        return reply
+          .status(400)
+          .send({
+            error:
+              "INVALID_CONFIRMATION_BODY",
+          });
+      }
+
+
+      /*
+       * Verificación de lo que Android leyó DESPUÉS
+       * de escribir el NFC.
+       */
+      if (
+        writtenCardId !==
+          cardId ||
+        writtenCardType !==
+          "CUSTOMER" ||
+        writtenStatus !==
+          "INACTIVE" ||
+        writtenBalance !==
+          0 ||
+        writtenTransactionCounter !==
+          0
+      ) {
+
+        return reply
+          .status(409)
+          .send({
+            error:
+              "RETURNED_CARD_STATE_MISMATCH",
+
+            message:
+              "La tarjeta física no quedó en el estado esperado. La devolución no fue confirmada.",
+          });
+      }
+
+
+      const normalizedDeviceCode =
+        deviceCode.trim();
+
+
+      const normalizedUid =
+        uid
+          .trim()
+          .toUpperCase();
+
+
+      const client =
+        await db.connect();
+
+
+      try {
+
+        await client.query(
+          "BEGIN"
+        );
+
+
+        const deviceResult =
+          await client.query(
+            `
+            select
+                id,
+                status
+
+            from devices
+
+            where device_code = $1
+
+            limit 1
+
+            for update
+            `,
+            [
+              normalizedDeviceCode,
+            ]
+          );
+
+
+        if (
+          deviceResult.rowCount ===
+          0
+        ) {
+
+          await client.query(
+            "ROLLBACK"
+          );
+
+
+          return reply
+            .status(404)
+            .send({
+              error:
+                "DEVICE_NOT_FOUND",
+            });
+        }
+
+
+        const device =
+          deviceResult.rows[0];
+
+
+        if (
+          device.status !==
+          "ACTIVE"
+        ) {
+
+          await client.query(
+            "ROLLBACK"
+          );
+
+
+          return reply
+            .status(409)
+            .send({
+              error:
+                "DEVICE_NOT_ACTIVE",
+            });
+        }
+
+
+        /*
+         * Revalidamos que la misma sesión que autorizó
+         * la devolución siga activa.
+         */
+        const operationResult =
+          await client.query(
+            `
+            select
+                returned_by_role,
+                returned_by_card_id,
+                recharge_point_id
+
+            from customer_card_return_operations
+
+            where id = $1
+
+            limit 1
+
+            for update
+            `,
+            [
+              operationId.trim(),
+            ]
+          );
+
+
+        if (
+          operationResult.rowCount ===
+          0
+        ) {
+
+          await client.query(
+            "ROLLBACK"
+          );
+
+
+          return reply
+            .status(404)
+            .send({
+              error:
+                "CARD_RETURN_OPERATION_NOT_FOUND",
+            });
+        }
+
+
+        const operation =
+          operationResult
+            .rows[0];
+
+
+        let sessionStillActive =
+          false;
+
+
+        if (
+          operation
+            .returned_by_role ===
+          "ADMIN"
+        ) {
+
+          const sessionResult =
+            await client.query(
+              `
+              select id
+
+              from device_admin_sessions
+
+              where device_id = $1
+
+                and admin_card_id =
+                    $2
+
+                and status =
+                    'ACTIVE'
+
+                and ended_at
+                    is null
+
+              limit 1
+              `,
+              [
+                device.id,
+                operation
+                  .returned_by_card_id,
+              ]
+            );
+
+
+          sessionStillActive =
+            Boolean(
+              sessionResult.rowCount &&
+              sessionResult.rowCount >
+                0
+            );
+
+
+        } else if (
+          operation
+            .returned_by_role ===
+          "RECHARGE"
+        ) {
+
+          const sessionResult =
+            await client.query(
+              `
+              select id
+
+              from device_recharge_sessions
+
+              where device_id = $1
+
+                and opened_by_card_id =
+                    $2
+
+                and recharge_point_id =
+                    $3
+
+                and status =
+                    'ACTIVE'
+
+                and ended_at
+                    is null
+
+              limit 1
+              `,
+              [
+                device.id,
+                operation
+                  .returned_by_card_id,
+                operation
+                  .recharge_point_id,
+              ]
+            );
+
+
+          sessionStillActive =
+            Boolean(
+              sessionResult.rowCount &&
+              sessionResult.rowCount >
+                0
+            );
+        }
+
+
+        if (
+          !sessionStillActive
+        ) {
+
+          await client.query(
+            "ROLLBACK"
+          );
+
+
+          return reply
+            .status(403)
+            .send({
+              error:
+                "RETURN_SESSION_NO_LONGER_ACTIVE",
+            });
+        }
+
+
+        /*
+         * Revalidación de cuarentena antes de confirmar el reset.
+         * Evita que una devolución previamente autorizada pueda
+         * modificar una tarjeta que entró a revisión manual.
+         */
+        const holdResult =
+          await client.query(
+            `
+            select
+                financial_hold,
+                financial_hold_reason,
+                financial_hold_at
+
+            from cards
+
+            where card_id = $1
+
+            limit 1
+
+            for update
+            `,
+            [
+              cardId,
+            ]
+          );
+
+
+        if (
+          holdResult.rowCount &&
+          holdResult.rowCount > 0 &&
+          holdResult.rows[0]
+            .financial_hold === true
+        ) {
+
+          await client.query(
+            "ROLLBACK"
+          );
+
+
+          return reply
+            .status(409)
+            .send({
+              error:
+                "CARD_FINANCIAL_HOLD",
+
+              reason:
+                holdResult.rows[0]
+                  .financial_hold_reason ??
+                "MANUAL_REVIEW_REQUIRED",
+
+              heldAt:
+                holdResult.rows[0]
+                  .financial_hold_at,
+
+              message:
+                "La tarjeta está en revisión manual y la devolución no puede confirmarse.",
+            });
+        }
+
+
+        const result =
+          await client.query(
+            `
+            select *
+
+            from financial_confirm_card_return(
+              $1,
+              $2,
+              $3,
+              $4
+            )
+            `,
+            [
+              operationId.trim(),
+              device.id,
+              cardId,
+              normalizedUid,
+            ]
+          );
+
+
+        const row =
+          result.rows[0];
+
+
+        await client.query(
+          "COMMIT"
+        );
+
+
+        return {
+          confirmed:
+            true,
+
+          duplicated:
+            Boolean(
+              row.duplicated
+            ),
+
+          returnId:
+            row.return_id,
+
+          operationId:
+            row.operation_id,
+
+          cardId:
+            Number(
+              row.card_id
+            ),
+
+          activationId:
+            row.activation_id,
+
+          refundAmount:
+            Number(
+              row.refund_amount
+            ),
+
+          discarded: {
+            cash:
+              Number(
+                row.discarded_cash
+              ),
+
+            promotional:
+              Number(
+                row.discarded_promotional
+              ),
+
+            adminCredit:
+              Number(
+                row.discarded_admin_credit
+              ),
+
+            legacy:
+              Number(
+                row.discarded_legacy
+              ),
+
+            total:
+              Number(
+                row.discarded_cash
+              ) +
+              Number(
+                row.discarded_promotional
+              ) +
+              Number(
+                row.discarded_admin_credit
+              ) +
+              Number(
+                row.discarded_legacy
+              ),
+          },
+
+          card: {
+            cardId,
+
+            uid:
+              normalizedUid,
+
+            type:
+              "CUSTOMER",
+
+            status:
+              "INACTIVE",
+
+            balance:
+              0,
+
+            transactionCounter:
+              0,
+
+            currentActivationId:
+              null,
+          },
+        };
+
+
+      } catch (
+        error: any
+      ) {
+
+        await client.query(
+          "ROLLBACK"
+        );
+
+
+        const message =
+          typeof error?.message ===
+          "string"
+            ? error.message
+            : "INTERNAL_ERROR";
+
+
+        const knownConflictErrors = [
+          "CARD_RETURN_DEVICE_MISMATCH",
+          "CARD_RETURN_CARD_MISMATCH",
+          "CARD_RETURN_UID_MISMATCH",
+          "CARD_RETURN_OPERATION_NOT_AUTHORIZED",
+          "CARD_ACTIVATION_CHANGED",
+          "CARD_BALANCE_CHANGED_AFTER_RETURN_AUTHORIZATION",
+          "CARD_COUNTER_CHANGED_AFTER_RETURN_AUTHORIZATION",
+          "ACTIVE_ACTIVATION_NOT_FOUND_DURING_CONFIRM",
+          "CARD_NOT_CUSTOMER",
+          "UID_MISMATCH",
+        ];
+
+
+        const knownError =
+          knownConflictErrors.find(
+            (code) =>
+              message.includes(
+                code
+              )
+          );
+
+
+        if (
+          knownError
+        ) {
+
+          return reply
+            .status(409)
+            .send({
+              error:
+                knownError,
+            });
+        }
+
+
+        server.log.error(
+          error
+        );
+
+
+        return reply
+          .status(500)
+          .send({
+            error:
+              "INTERNAL_ERROR",
+          });
+
+
+      } finally {
+
+        client.release();
+      }
+    }
+  );
+
+
+  /*
+   * =====================================================
+   * REPORTAR FALLO DE DEVOLUCIÓN
+   * =====================================================
+   *
+   * POST /customer-support/card-return/fail
+   * =====================================================
+   */
+
+  server.post<{
+    Body:
+      CardReturnFailBody;
+  }>(
+    "/customer-support/card-return/fail",
+
+    async (
+      request,
+      reply
+    ) => {
+
+      const {
+        operationId,
+        deviceCode,
+        reason,
+      } =
+        request.body;
+
+
+      if (
+        typeof operationId !==
+          "string" ||
+        operationId
+          .trim()
+          .length ===
+          0 ||
+        typeof deviceCode !==
+          "string" ||
+        deviceCode
+          .trim()
+          .length ===
+          0
+      ) {
+
+        return reply
+          .status(400)
+          .send({
+            error:
+              "INVALID_FAIL_BODY",
+          });
+      }
+
+
+      const deviceResult =
+        await db.query(
+          `
+          select
+              id,
+              status
+
+          from devices
+
+          where device_code = $1
+
+          limit 1
+          `,
+          [
+            deviceCode.trim(),
+          ]
+        );
+
+
+      if (
+        deviceResult.rowCount ===
+        0
+      ) {
+
+        return reply
+          .status(404)
+          .send({
+            error:
+              "DEVICE_NOT_FOUND",
+          });
+      }
+
+
+      if (
+        deviceResult
+          .rows[0]
+          .status !==
+        "ACTIVE"
+      ) {
+
+        return reply
+          .status(409)
+          .send({
+            error:
+              "DEVICE_NOT_ACTIVE",
+          });
+      }
+
+
+      const result =
+        await db.query(
+          `
+          select
+              financial_fail_card_return(
+                $1,
+                $2,
+                $3
+              ) as failed
+          `,
+          [
+            operationId.trim(),
+            deviceResult
+              .rows[0]
+              .id,
+            reason ??
+              "Fallo reportado por dispositivo.",
+          ]
+        );
+
+
+      if (
+        !result
+          .rows[0]
+          .failed
+      ) {
+
+        return reply
+          .status(409)
+          .send({
+            error:
+              "CARD_RETURN_CANNOT_BE_FAILED",
+          });
+      }
+
+
+      return {
+        failed:
+          true,
+
+        operationId:
+          operationId.trim(),
+      };
+    }
+  );
+
 }

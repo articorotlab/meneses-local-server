@@ -1,14 +1,8 @@
 import type { FastifyInstance } from "fastify";
 import { db } from "../db/database.js";
+import { verifyDeviceSecret } from "../auth/deviceCredential.js";
 
 type CreatePromotionBody = {
-  deviceCode: string;
-  name: string;
-  cashAmount: number;
-  promotionalAmount: number;
-};
-
-type UpdatePromotionBody = {
   deviceCode: string;
   name: string;
   cashAmount: number;
@@ -18,6 +12,11 @@ type UpdatePromotionBody = {
 type PromotionStatusBody = {
   deviceCode: string;
   active: boolean;
+};
+
+type ActivePromotionsHeaders = {
+  "x-device-code"?: string;
+  "x-device-token"?: string;
 };
 
 export async function promotionManagementRoutes(
@@ -300,160 +299,6 @@ export async function promotionManagementRoutes(
     }
   );
 
-  server.put<{
-    Params: {
-      promotionId: string;
-    };
-    Body: UpdatePromotionBody;
-  }>(
-    "/admin/promotions/:promotionId",
-    async (request, reply) => {
-      const { promotionId } = request.params;
-      const {
-        deviceCode,
-        name,
-        cashAmount,
-        promotionalAmount,
-      } = request.body;
-
-      if (
-        typeof promotionId !== "string" ||
-        promotionId.trim().length === 0
-      ) {
-        return reply.status(400).send({
-          error: "INVALID_PROMOTION_ID",
-        });
-      }
-
-      if (
-        typeof deviceCode !== "string" ||
-        deviceCode.trim().length === 0
-      ) {
-        return reply.status(400).send({
-          error: "INVALID_DEVICE_CODE",
-        });
-      }
-
-      if (
-        typeof name !== "string" ||
-        name.trim().length < 2
-      ) {
-        return reply.status(400).send({
-          error: "INVALID_PROMOTION_NAME",
-        });
-      }
-
-      if (
-        !Number.isSafeInteger(cashAmount) ||
-        cashAmount <= 0
-      ) {
-        return reply.status(400).send({
-          error: "INVALID_CASH_AMOUNT",
-        });
-      }
-
-      if (
-        !Number.isSafeInteger(promotionalAmount) ||
-        promotionalAmount < 0
-      ) {
-        return reply.status(400).send({
-          error: "INVALID_PROMOTIONAL_AMOUNT",
-        });
-      }
-
-      const client = await db.connect();
-
-      try {
-        await client.query("BEGIN");
-
-        const admin = await getAdminActor(
-          client,
-          deviceCode
-        );
-
-        if (admin === null) {
-          await client.query("ROLLBACK");
-          return reply.status(403).send({
-            error: "ADMIN_PERMISSION_REQUIRED",
-          });
-        }
-
-        const result = await client.query(
-          `
-          update promotions
-          set
-              name = $2,
-              cash_amount = $3,
-              promotional_amount = $4,
-              updated_at = now()
-          where id = $1
-          returning
-              id,
-              name,
-              cash_amount,
-              promotional_amount,
-              total_credit_amount,
-              active,
-              created_by_admin_card_id,
-              created_at,
-              updated_at
-          `,
-          [
-            promotionId.trim(),
-            name.trim(),
-            cashAmount,
-            promotionalAmount,
-          ]
-        );
-
-        if (result.rowCount === 0) {
-          await client.query("ROLLBACK");
-          return reply.status(404).send({
-            error: "PROMOTION_NOT_FOUND",
-          });
-        }
-
-        const promotion = result.rows[0];
-
-        await client.query("COMMIT");
-
-        return {
-          updated: true,
-          promotion: {
-            id: promotion.id,
-            name: promotion.name,
-            cashAmount: Number(
-              promotion.cash_amount
-            ),
-            promotionalAmount: Number(
-              promotion.promotional_amount
-            ),
-            totalCreditAmount: Number(
-              promotion.total_credit_amount
-            ),
-            active: promotion.active,
-            updatedAt: promotion.updated_at,
-          },
-        };
-      } catch (error: any) {
-        await client.query("ROLLBACK");
-
-        if (error?.code === "22P02") {
-          return reply.status(400).send({
-            error: "INVALID_PROMOTION_ID",
-          });
-        }
-
-        server.log.error(error);
-        return reply.status(500).send({
-          error: "INTERNAL_ERROR",
-        });
-      } finally {
-        client.release();
-      }
-    }
-  );
-
   server.patch<{
     Params: {
       promotionId: string;
@@ -578,4 +423,233 @@ export async function promotionManagementRoutes(
       }
     }
   );
+
+  /*
+   * =====================================================
+   * PROMOCIONES ACTIVAS PARA TAQUILLA
+   *
+   * GET /promotions/active
+   *
+   * Autenticación:
+   *
+   *   x-device-code
+   *   x-device-token
+   *
+   * El token nunca viaja en la URL.
+   * Solamente dispositivos RECHARGE activos pueden
+   * consultar este catálogo operacional.
+   * =====================================================
+   */
+
+  server.get<{
+    Headers: ActivePromotionsHeaders;
+  }>(
+    "/promotions/active",
+
+    async (request, reply) => {
+
+      const deviceCode =
+        request.headers[
+          "x-device-code"
+        ];
+
+      const deviceToken =
+        request.headers[
+          "x-device-token"
+        ];
+
+      if (
+        typeof deviceCode !==
+          "string" ||
+        deviceCode.trim()
+          .length === 0 ||
+        typeof deviceToken !==
+          "string" ||
+        deviceToken.trim()
+          .length === 0
+      ) {
+
+        return reply
+          .status(400)
+          .send({
+            error:
+              "INVALID_DEVICE_CREDENTIALS",
+          });
+      }
+
+      const client =
+        await db.connect();
+
+      try {
+
+        const deviceResult =
+          await client.query(
+            `
+            select
+                id,
+                device_code,
+                name,
+                device_type,
+                status,
+                credential_hash
+
+            from devices
+
+            where device_code = $1
+
+            limit 1
+            `,
+            [
+              deviceCode.trim(),
+            ]
+          );
+
+        if (
+          deviceResult.rowCount ===
+          0
+        ) {
+
+          return reply
+            .status(401)
+            .send({
+              error:
+                "INVALID_DEVICE_CREDENTIALS",
+            });
+        }
+
+        const device =
+          deviceResult.rows[0];
+
+        if (
+          device.status !==
+          "ACTIVE"
+        ) {
+
+          return reply
+            .status(403)
+            .send({
+              error:
+                "DEVICE_NOT_ACTIVE",
+
+              status:
+                device.status,
+            });
+        }
+
+        if (
+          typeof device
+            .credential_hash !==
+            "string" ||
+          !verifyDeviceSecret(
+            deviceToken,
+            device.credential_hash
+          )
+        ) {
+
+          return reply
+            .status(401)
+            .send({
+              error:
+                "INVALID_DEVICE_CREDENTIALS",
+            });
+        }
+
+        if (
+          device.device_type !==
+          "RECHARGE"
+        ) {
+
+          return reply
+            .status(409)
+            .send({
+              error:
+                "DEVICE_NOT_RECHARGE",
+            });
+        }
+
+        const promotionsResult =
+          await client.query(
+            `
+            select
+                id,
+                name,
+                cash_amount,
+                promotional_amount,
+                total_credit_amount
+
+            from active_promotions
+
+            order by
+                cash_amount asc,
+                total_credit_amount asc,
+                created_at asc
+            `
+          );
+
+        await client.query(
+          `
+          update devices
+
+          set
+              last_seen_at =
+                  now(),
+
+              updated_at =
+                  now()
+
+          where id = $1
+          `,
+          [
+            device.id,
+          ]
+        );
+
+        return {
+          promotions:
+            promotionsResult.rows.map(
+              (row: any) => ({
+                id:
+                  row.id,
+
+                name:
+                  row.name,
+
+                cashAmount:
+                  Number(
+                    row.cash_amount
+                  ),
+
+                promotionalAmount:
+                  Number(
+                    row
+                      .promotional_amount
+                  ),
+
+                totalCreditAmount:
+                  Number(
+                    row
+                      .total_credit_amount
+                  ),
+              })
+            ),
+        };
+
+      } catch (error) {
+
+        server.log.error(error);
+
+        return reply
+          .status(500)
+          .send({
+            error:
+              "INTERNAL_ERROR",
+          });
+
+      } finally {
+
+        client.release();
+      }
+    }
+  );
+
 }

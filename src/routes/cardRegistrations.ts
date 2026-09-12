@@ -548,58 +548,73 @@ export async function cardRegistrationRoutes(
 
         /*
          * -----------------------------------------------
-         * UID YA REGISTRADO
+         * UID EXISTENTE / REUTILIZACIÓN
          * -----------------------------------------------
+         *
+         * Una CUSTOMER devuelta conserva el mismo UID y
+         * card_id, pero queda INACTIVE, en cero y sin
+         * current_activation_id.
+         *
+         * Solo se reutiliza si su última activación quedó
+         * RETURNED y existe auditoría en customer_card_returns.
          */
 
         const existingCardResult =
           await client.query(
             `
             select
-                card_id,
-                card_type,
-                status
+                c.card_id,
+                c.card_type,
+                c.status,
+                c.balance,
+                c.transaction_counter,
+                c.current_activation_id,
 
-            from cards
+                last_activation.id
+                  as last_activation_id,
 
-            where upper(uid) =
+                last_activation.status
+                  as last_activation_status,
+
+                (
+                  r.id is not null
+                ) as has_return_audit
+
+            from cards c
+
+            left join lateral (
+              select
+                  a.id,
+                  a.status,
+                  a.activation_number
+
+              from customer_card_activations a
+
+              where a.card_id =
+                    c.card_id
+
+              order by
+                  a.activation_number desc
+
+              limit 1
+            ) last_activation
+                on true
+
+            left join customer_card_returns r
+                on r.activation_id =
+                   last_activation.id
+
+            where upper(c.uid) =
                   upper($1)
 
             limit 1
+
+            for update of c
             `,
             [
               normalizedUid,
             ]
           );
-
-
-        if (
-          existingCardResult
-            .rowCount &&
-          existingCardResult
-            .rowCount >
-            0
-        ) {
-
-          await client.query(
-            "ROLLBACK"
-          );
-
-
-          return reply
-            .status(409)
-            .send({
-              error:
-                "UID_ALREADY_REGISTERED",
-
-              cardId:
-                Number(
-                  existingCardResult
-                    .rows[0]
-                    .card_id
-                ),
-            });
-        }
 
 
         /*
@@ -663,29 +678,123 @@ export async function cardRegistrationRoutes(
         }
 
 
-        /*
-         * -----------------------------------------------
-         * RESERVAR CARD ID
-         * -----------------------------------------------
-         */
-
-        const sequenceResult =
-          await client.query(
-            `
-            select
-                nextval(
-                  'card_id_seq'
-                ) as card_id
-            `
-          );
+        let reservedCardId:
+          number;
 
 
-        const reservedCardId =
-          Number(
-            sequenceResult
-              .rows[0]
-              .card_id
-          );
+        let reusedCard =
+          false;
+
+
+        if (
+          existingCardResult
+            .rowCount &&
+          existingCardResult
+            .rowCount >
+            0
+        ) {
+
+          const existingCard =
+            existingCardResult
+              .rows[0];
+
+
+          const reusable =
+            existingCard
+              .card_type ===
+              "CUSTOMER" &&
+
+            existingCard
+              .status ===
+              "INACTIVE" &&
+
+            Number(
+              existingCard.balance
+            ) ===
+              0 &&
+
+            Number(
+              existingCard
+                .transaction_counter
+            ) ===
+              0 &&
+
+            existingCard
+              .current_activation_id ===
+              null &&
+
+            existingCard
+              .last_activation_id !==
+              null &&
+
+            existingCard
+              .last_activation_status ===
+              "RETURNED" &&
+
+            Boolean(
+              existingCard
+                .has_return_audit
+            );
+
+
+          if (
+            !reusable
+          ) {
+
+            await client.query(
+              "ROLLBACK"
+            );
+
+
+            return reply
+              .status(409)
+              .send({
+                error:
+                  "UID_ALREADY_REGISTERED",
+
+                cardId:
+                  Number(
+                    existingCard
+                      .card_id
+                  ),
+
+                message:
+                  "La tarjeta ya está registrada y no se encuentra en un estado reutilizable.",
+              });
+          }
+
+
+          reservedCardId =
+            Number(
+              existingCard
+                .card_id
+            );
+
+
+          reusedCard =
+            true;
+
+
+        } else {
+
+          const sequenceResult =
+            await client.query(
+              `
+              select
+                  nextval(
+                    'card_id_seq'
+                  ) as card_id
+              `
+            );
+
+
+          reservedCardId =
+            Number(
+              sequenceResult
+                .rows[0]
+                .card_id
+            );
+        }
 
 
         /*
@@ -801,6 +910,9 @@ export async function cardRegistrationRoutes(
 
           cardType:
             targetCardType,
+
+          reused:
+            reusedCard,
 
           initialState: {
             balance:
@@ -1307,66 +1419,28 @@ export async function cardRegistrationRoutes(
 
 
         /*
-         * -----------------------------------------------
-         * CREAR CARD DEFINITIVA
-         * -----------------------------------------------
-         *
-         * IMPORTANTE:
-         *
-         * El costo de activación NO es saldo.
-         *
-         * La CUSTOMER siempre nace con:
-         *
-         * balance = 0
-         * transaction_counter = 0
-         */
-
-        await client.query(
-          `
-          insert into cards (
-              card_id,
-              uid,
-              card_type,
-              status,
-              balance,
-              transaction_counter
-          )
-
-          values (
-              $1,
-              $2,
-              'CUSTOMER',
-              'ACTIVE',
-              0,
-              0
-          )
-          `,
-          [
-            writtenCardId,
-
-            targetUid
-              .trim()
-              .toUpperCase(),
-          ]
-        );
-
-
-        /*
          * =================================================
-         * INGRESO POR ACTIVACIÓN DE TARJETA
+         * PREPARAR ACTIVACIÓN CUSTOMER
          * =================================================
          *
-         * Solamente cuando la CUSTOMER fue creada desde
-         * una TAQUILLA.
-         *
-         * ADMIN puede crear CUSTOMER, pero esa creación
-         * no se atribuye como ingreso a ninguna taquilla.
+         * cards representa la tarjeta física permanente.
+         * customer_card_activations representa cada ciclo
+         * de cliente.
          * =================================================
          */
 
-        let activationFee:
-          number | null =
-            null;
+        const normalizedTargetUid =
+          targetUid
+            .trim()
+            .toUpperCase();
+
+
+        let activationFee =
+          0;
+
+
+        let activationFeeKnown =
+          false;
 
 
         if (
@@ -1374,12 +1448,6 @@ export async function cardRegistrationRoutes(
             .actor_role ===
           "RECHARGE"
         ) {
-
-          /*
-           * ---------------------------------------------
-           * PRECIO VIGENTE
-           * ---------------------------------------------
-           */
 
           const settingsResult =
             await client.query(
@@ -1432,18 +1500,351 @@ export async function cardRegistrationRoutes(
           }
 
 
-          /*
-           * ---------------------------------------------
-           * CARD_CREATED
-           * ---------------------------------------------
-           *
-           * La idempotency key es determinista:
-           *
-           * card-created:<registrationId>
-           *
-           * Así una misma activación nunca puede crear
-           * dos ingresos.
-           */
+          activationFeeKnown =
+            true;
+        }
+
+
+        /*
+         * -----------------------------------------------
+         * TARJETA NUEVA O REUTILIZADA
+         * -----------------------------------------------
+         */
+
+        const existingCardResult =
+          await client.query(
+            `
+            select
+                c.card_id,
+                c.uid,
+                c.card_type,
+                c.status,
+                c.balance,
+                c.transaction_counter,
+                c.current_activation_id,
+
+                last_activation.id
+                  as last_activation_id,
+
+                last_activation.status
+                  as last_activation_status,
+
+                (
+                  r.id is not null
+                ) as has_return_audit
+
+            from cards c
+
+            left join lateral (
+              select
+                  a.id,
+                  a.status,
+                  a.activation_number
+
+              from customer_card_activations a
+
+              where a.card_id =
+                    c.card_id
+
+              order by
+                  a.activation_number desc
+
+              limit 1
+            ) last_activation
+                on true
+
+            left join customer_card_returns r
+                on r.activation_id =
+                   last_activation.id
+
+            where c.card_id = $1
+
+            limit 1
+
+            for update of c
+            `,
+            [
+              writtenCardId,
+            ]
+          );
+
+
+        let reusedCard =
+          false;
+
+
+        if (
+          existingCardResult.rowCount &&
+          existingCardResult.rowCount >
+            0
+        ) {
+
+          const existingCard =
+            existingCardResult
+              .rows[0];
+
+
+          const reusable =
+            existingCard
+              .card_type ===
+              "CUSTOMER" &&
+
+            existingCard
+              .uid
+              .trim()
+              .toUpperCase() ===
+              normalizedTargetUid &&
+
+            existingCard
+              .status ===
+              "INACTIVE" &&
+
+            Number(
+              existingCard.balance
+            ) ===
+              0 &&
+
+            Number(
+              existingCard
+                .transaction_counter
+            ) ===
+              0 &&
+
+            existingCard
+              .current_activation_id ===
+              null &&
+
+            existingCard
+              .last_activation_id !==
+              null &&
+
+            existingCard
+              .last_activation_status ===
+              "RETURNED" &&
+
+            Boolean(
+              existingCard
+                .has_return_audit
+            );
+
+
+          if (
+            !reusable
+          ) {
+
+            throw new Error(
+              "CARD_NOT_REUSABLE"
+            );
+          }
+
+
+          await client.query(
+            `
+            update cards
+
+            set
+                status =
+                  'ACTIVE',
+
+                balance =
+                  0,
+
+                transaction_counter =
+                  0,
+
+                updated_at =
+                  now()
+
+            where card_id = $1
+            `,
+            [
+              writtenCardId,
+            ]
+          );
+
+
+          reusedCard =
+            true;
+
+
+        } else {
+
+          await client.query(
+            `
+            insert into cards (
+                card_id,
+                uid,
+                card_type,
+                status,
+                balance,
+                transaction_counter
+            )
+
+            values (
+                $1,
+                $2,
+                'CUSTOMER',
+                'ACTIVE',
+                0,
+                0
+            )
+            `,
+            [
+              writtenCardId,
+              normalizedTargetUid,
+            ]
+          );
+        }
+
+
+        const activationNumberResult =
+          await client.query(
+            `
+            select
+                coalesce(
+                  max(
+                    activation_number
+                  ),
+                  0
+                ) + 1
+                  as next_activation_number
+
+            from customer_card_activations
+
+            where card_id = $1
+            `,
+            [
+              writtenCardId,
+            ]
+          );
+
+
+        const activationNumber =
+          Number(
+            activationNumberResult
+              .rows[0]
+              .next_activation_number
+          );
+
+
+        if (
+          !Number.isSafeInteger(
+            activationNumber
+          ) ||
+          activationNumber <=
+            0
+        ) {
+
+          throw new Error(
+            "INVALID_NEXT_ACTIVATION_NUMBER"
+          );
+        }
+
+
+        const activationResult =
+          await client.query(
+            `
+            insert into customer_card_activations (
+                card_id,
+                activation_number,
+                activation_fee,
+                activation_fee_known,
+                status,
+                activated_by_role,
+                activated_by_card_id,
+                recharge_point_id,
+                started_at
+            )
+
+            values (
+                $1,
+                $2,
+                $3,
+                $4,
+                'ACTIVE',
+                $5,
+                $6,
+                $7,
+                now()
+            )
+
+            returning
+                id,
+                activation_number,
+                activation_fee,
+                activation_fee_known,
+                status,
+                recharge_point_id,
+                started_at
+            `,
+            [
+              writtenCardId,
+              activationNumber,
+              activationFee,
+              activationFeeKnown,
+              registration
+                .actor_role,
+              registration
+                .actor_card_id,
+              registration
+                .actor_role ===
+              "RECHARGE"
+                ? registration
+                    .recharge_point_id
+                : null,
+            ]
+          );
+
+
+        const activation =
+          activationResult
+            .rows[0];
+
+
+        await client.query(
+          `
+          update cards
+
+          set
+              current_activation_id =
+                $2,
+
+              status =
+                'ACTIVE',
+
+              balance =
+                0,
+
+              transaction_counter =
+                0,
+
+              updated_at =
+                now()
+
+          where card_id = $1
+          `,
+          [
+            writtenCardId,
+            activation.id,
+          ]
+        );
+
+
+        /*
+         * =================================================
+         * INGRESO POR ACTIVACIÓN DE TARJETA
+         * =================================================
+         *
+         * Solo RECHARGE genera ingreso real de taquilla.
+         * CARD_CREATED queda ligado a activation_id.
+         * =================================================
+         */
+
+        if (
+          registration
+            .actor_role ===
+          "RECHARGE"
+        ) {
 
           const transactionIdempotencyKey =
             `card-created:${registrationId}`;
@@ -1453,58 +1854,42 @@ export async function cardRegistrationRoutes(
             `
             insert into transactions (
                 idempotency_key,
-
                 card_id,
+                activation_id,
                 device_id,
-
                 transaction_type,
                 amount,
-
                 balance_before,
                 balance_after,
-
                 counter_before,
                 counter_after,
-
                 card_write_status,
-
                 confirmed_at,
-
                 unit_price,
                 quantity,
-
                 recharge_point_id,
-
                 actor_role,
                 actor_card_id
             )
 
             values (
                 $1,
-
                 $2,
                 $3,
-
-                'CARD_CREATED',
                 $4,
-
-                0,
-                0,
-
-                0,
-                0,
-
-                'CONFIRMED',
-
-                now(),
-
+                'CARD_CREATED',
                 $5,
-                1,
-
+                0,
+                0,
+                0,
+                0,
+                'CONFIRMED',
+                now(),
                 $6,
-
+                1,
+                $7,
                 'RECHARGE',
-                $7
+                $8
             )
 
             on conflict (
@@ -1515,30 +1900,17 @@ export async function cardRegistrationRoutes(
             `,
             [
               transactionIdempotencyKey,
-
               writtenCardId,
-
+              activation.id,
               registration
                 .device_id,
-
               activationFee,
-
-              /*
-               * transactions_unit_price_check:
-               *
-               * unit_price debe ser > 0 cuando no es NULL.
-               *
-               * Permitimos configurar activación en $0,
-               * por eso en ese caso guardamos NULL.
-               */
               activationFee >
               0
                 ? activationFee
                 : null,
-
               registration
                 .recharge_point_id,
-
               registration
                 .actor_card_id,
             ]
@@ -1625,31 +1997,50 @@ export async function cardRegistrationRoutes(
               0,
           },
 
-          activation:
-            registration
-              .actor_role ===
-            "RECHARGE"
-              ? {
-                  charged:
-                    true,
+          activation: {
+            activationId:
+              activation.id,
 
-                  amount:
-                    activationFee,
+            activationNumber:
+              Number(
+                activation
+                  .activation_number
+              ),
 
-                  rechargePointId:
-                    registration
-                      .recharge_point_id,
-                }
-              : {
-                  charged:
-                    false,
+            fee:
+              Number(
+                activation
+                  .activation_fee
+              ),
 
-                  amount:
-                    0,
+            feeKnown:
+              Boolean(
+                activation
+                  .activation_fee_known
+              ),
 
-                  rechargePointId:
-                    null,
-                },
+            charged:
+              registration
+                .actor_role ===
+              "RECHARGE",
+
+            amount:
+              registration
+                .actor_role ===
+              "RECHARGE"
+                ? activationFee
+                : 0,
+
+            rechargePointId:
+              registration
+                .actor_role ===
+              "RECHARGE"
+                ? registration
+                    .recharge_point_id
+                : null,
+
+            reusedCard,
+          },
         };
 
 
@@ -1660,6 +2051,23 @@ export async function cardRegistrationRoutes(
         await client.query(
           "ROLLBACK"
         );
+
+
+        if (
+          error?.message ===
+          "CARD_NOT_REUSABLE"
+        ) {
+
+          return reply
+            .status(409)
+            .send({
+              error:
+                "CARD_NOT_REUSABLE",
+
+              message:
+                "La tarjeta registrada no se encuentra en un estado válido para iniciar una nueva activación.",
+            });
+        }
 
 
         if (
