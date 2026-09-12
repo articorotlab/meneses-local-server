@@ -38,6 +38,10 @@ import {
 } from "./routes/cardRegistrations.js";
 
 import {
+  rechargeCheckoutRoutes,
+} from "./routes/rechargeCheckouts.js";
+
+import {
   gameManagementRoutes,
 } from "./routes/gameManagement.js";
 
@@ -288,6 +292,17 @@ async function start() {
 
     await server.register(
       cardRegistrationRoutes
+    );
+
+
+    /*
+     * =====================================================
+     * CHECKOUT DE RECARGA / AUTO CUSTOMER
+     * =====================================================
+     */
+
+    await server.register(
+      rechargeCheckoutRoutes
     );
 
 
