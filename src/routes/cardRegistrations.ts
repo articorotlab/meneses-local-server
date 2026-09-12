@@ -13,6 +13,12 @@ import {
  * =========================================================
  */
 
+type InspectCustomerBody = {
+  deviceCode: string;
+  targetUid: string;
+};
+
+
 type AuthorizeBody = {
   idempotencyKey: string;
   deviceCode: string;
@@ -71,6 +77,816 @@ type FailBody = {
 export async function cardRegistrationRoutes(
   server: FastifyInstance
 ) {
+
+  /*
+   * =====================================================
+   * CUSTOMER INSPECT (READ-ONLY)
+   * =====================================================
+   *
+   * POST /card-registrations/customer/inspect
+   *
+   * Esta ruta NO crea registros, NO crea activaciones,
+   * NO crea transacciones y NO modifica cards.
+   *
+   * Su única responsabilidad es clasificar el UID desde
+   * PostgreSQL antes de que Android decida si debe:
+   *
+   * - continuar con una CUSTOMER activa;
+   * - registrar una tarjeta nueva;
+   * - reutilizar una CUSTOMER devuelta correctamente;
+   * - detenerse porque el estado no es seguro.
+   */
+
+  server.post<{
+    Body:
+      InspectCustomerBody;
+  }>(
+    "/card-registrations/customer/inspect",
+
+    async (
+      request,
+      reply
+    ) => {
+
+      const {
+        deviceCode,
+        targetUid,
+      } =
+        request.body;
+
+
+      if (
+        typeof deviceCode !==
+          "string" ||
+        deviceCode
+          .trim()
+          .length ===
+          0
+      ) {
+
+        return reply
+          .status(400)
+          .send({
+            error:
+              "INVALID_DEVICE_CODE",
+          });
+      }
+
+
+      if (
+        typeof targetUid !==
+          "string" ||
+        targetUid
+          .trim()
+          .length ===
+          0
+      ) {
+
+        return reply
+          .status(400)
+          .send({
+            error:
+              "INVALID_TARGET_UID",
+          });
+      }
+
+
+      const normalizedDeviceCode =
+        deviceCode.trim();
+
+
+      const normalizedUid =
+        targetUid
+          .trim()
+          .toUpperCase();
+
+
+      const client =
+        await db.connect();
+
+
+      try {
+
+        /*
+         * -----------------------------------------------
+         * DISPOSITIVO
+         * -----------------------------------------------
+         */
+
+        const deviceResult =
+          await client.query(
+            `
+            select
+                id,
+                device_code,
+                name,
+                status
+
+            from devices
+
+            where device_code = $1
+
+            limit 1
+            `,
+            [
+              normalizedDeviceCode,
+            ]
+          );
+
+
+        if (
+          deviceResult.rowCount ===
+          0
+        ) {
+
+          return reply
+            .status(404)
+            .send({
+              error:
+                "DEVICE_NOT_FOUND",
+            });
+        }
+
+
+        const device =
+          deviceResult.rows[0];
+
+
+        if (
+          device.status !==
+          "ACTIVE"
+        ) {
+
+          return reply
+            .status(409)
+            .send({
+              error:
+                "DEVICE_NOT_ACTIVE",
+            });
+        }
+
+
+        /*
+         * -----------------------------------------------
+         * ACTOR ACTIVO
+         * -----------------------------------------------
+         *
+         * La inspección solamente está disponible cuando
+         * el Ulefone tiene una sesión ADMIN o RECHARGE
+         * activa, igual que la creación de CUSTOMER.
+         */
+
+        const adminResult =
+          await client.query(
+            `
+            select
+                s.admin_card_id
+
+            from device_admin_sessions s
+
+            where s.device_id = $1
+              and s.status = 'ACTIVE'
+              and s.ended_at is null
+
+            limit 1
+            `,
+            [
+              device.id,
+            ]
+          );
+
+
+        const rechargeResult =
+          await client.query(
+            `
+            select
+                s.opened_by_card_id,
+                s.recharge_point_id,
+                rp.recharge_code,
+                rp.name
+                  as recharge_point_name
+
+            from device_recharge_sessions s
+
+            join recharge_points rp
+                on rp.id =
+                   s.recharge_point_id
+
+            where s.device_id = $1
+              and s.status = 'ACTIVE'
+              and s.ended_at is null
+
+            limit 1
+            `,
+            [
+              device.id,
+            ]
+          );
+
+
+        let actorRole:
+          "ADMIN" |
+          "RECHARGE";
+
+
+        let actorCardId:
+          number;
+
+
+        let rechargePointId:
+          string | null =
+            null;
+
+
+        if (
+          adminResult.rowCount &&
+          adminResult.rowCount >
+            0
+        ) {
+
+          actorRole =
+            "ADMIN";
+
+          actorCardId =
+            Number(
+              adminResult
+                .rows[0]
+                .admin_card_id
+            );
+
+
+        } else if (
+          rechargeResult.rowCount &&
+          rechargeResult.rowCount >
+            0
+        ) {
+
+          const session =
+            rechargeResult
+              .rows[0];
+
+
+          if (
+            session
+              .opened_by_card_id ===
+            null
+          ) {
+
+            return reply
+              .status(409)
+              .send({
+                error:
+                  "RECHARGE_SESSION_HAS_NO_CARD",
+              });
+          }
+
+
+          actorRole =
+            "RECHARGE";
+
+          actorCardId =
+            Number(
+              session
+                .opened_by_card_id
+            );
+
+          rechargePointId =
+            session
+              .recharge_point_id;
+
+
+        } else {
+
+          return reply
+            .status(403)
+            .send({
+              error:
+                "CARD_REGISTRATION_PERMISSION_REQUIRED",
+
+              message:
+                "Se necesita una sesión ADMIN o RECHARGE activa para inspeccionar una CUSTOMER.",
+            });
+        }
+
+
+        /*
+         * -----------------------------------------------
+         * REGISTRATION PENDIENTE
+         * -----------------------------------------------
+         *
+         * Si existe una creación pendiente sobre el UID no
+         * intentamos clasificarlo como NEW ni REUSABLE.
+         * Esto evita abrir una segunda creación mientras la
+         * primera todavía necesita resolverse.
+         */
+
+        const pendingResult =
+          await client.query(
+            `
+            select
+                id,
+                reserved_card_id,
+                actor_role,
+                actor_card_id,
+                recharge_point_id,
+                created_at
+
+            from card_registrations
+
+            where upper(target_uid) =
+                  upper($1)
+
+              and status =
+                  'PENDING'
+
+            order by created_at desc
+
+            limit 1
+            `,
+            [
+              normalizedUid,
+            ]
+          );
+
+
+        if (
+          pendingResult.rowCount &&
+          pendingResult.rowCount >
+            0
+        ) {
+
+          const pending =
+            pendingResult
+              .rows[0];
+
+
+          return {
+            inspection:
+              "NOT_REUSABLE",
+
+            reason:
+              "UID_HAS_PENDING_REGISTRATION",
+
+            uid:
+              normalizedUid,
+
+            actor: {
+              role:
+                actorRole,
+
+              cardId:
+                actorCardId,
+
+              rechargePointId,
+            },
+
+            pendingRegistration: {
+              registrationId:
+                pending.id,
+
+              cardId:
+                Number(
+                  pending
+                    .reserved_card_id
+                ),
+
+              actorRole:
+                pending
+                  .actor_role,
+
+              actorCardId:
+                Number(
+                  pending
+                    .actor_card_id
+                ),
+
+              rechargePointId:
+                pending
+                  .recharge_point_id,
+
+              createdAt:
+                pending
+                  .created_at,
+            },
+          };
+        }
+
+
+        /*
+         * -----------------------------------------------
+         * ESTADO REGISTRADO DEL UID
+         * -----------------------------------------------
+         */
+
+        const cardResult =
+          await client.query(
+            `
+            select
+                c.card_id,
+                c.uid,
+                c.card_type,
+                c.status,
+                c.balance,
+                c.transaction_counter,
+                c.current_activation_id,
+                c.financial_hold,
+                c.financial_hold_reason,
+                c.financial_hold_at,
+
+                last_activation.id
+                  as last_activation_id,
+
+                last_activation.status
+                  as last_activation_status,
+
+                last_activation.activation_number
+                  as last_activation_number,
+
+                (
+                  r.id is not null
+                ) as has_return_audit
+
+            from cards c
+
+            left join lateral (
+              select
+                  a.id,
+                  a.status,
+                  a.activation_number
+
+              from customer_card_activations a
+
+              where a.card_id =
+                    c.card_id
+
+              order by
+                  a.activation_number desc
+
+              limit 1
+            ) last_activation
+                on true
+
+            left join customer_card_returns r
+                on r.activation_id =
+                   last_activation.id
+
+            where upper(c.uid) =
+                  upper($1)
+
+            limit 1
+            `,
+            [
+              normalizedUid,
+            ]
+          );
+
+
+        /*
+         * UID nunca registrado.
+         */
+
+        if (
+          cardResult.rowCount ===
+          0
+        ) {
+
+          return {
+            inspection:
+              "NEW",
+
+            reason:
+              null,
+
+            uid:
+              normalizedUid,
+
+            actor: {
+              role:
+                actorRole,
+
+              cardId:
+                actorCardId,
+
+              rechargePointId,
+            },
+
+            card:
+              null,
+          };
+        }
+
+
+        const card =
+          cardResult.rows[0];
+
+
+        const cardSnapshot = {
+          cardId:
+            Number(
+              card.card_id
+            ),
+
+          uid:
+            String(
+              card.uid
+            ).toUpperCase(),
+
+          cardType:
+            card.card_type,
+
+          status:
+            card.status,
+
+          balance:
+            Number(
+              card.balance
+            ),
+
+          transactionCounter:
+            Number(
+              card.transaction_counter
+            ),
+
+          currentActivationId:
+            card
+              .current_activation_id,
+
+          financialHold:
+            Boolean(
+              card
+                .financial_hold
+            ),
+
+          financialHoldReason:
+            card
+              .financial_hold_reason,
+
+          financialHoldAt:
+            card
+              .financial_hold_at,
+
+          lastActivationId:
+            card
+              .last_activation_id,
+
+          lastActivationStatus:
+            card
+              .last_activation_status,
+
+          lastActivationNumber:
+            card
+              .last_activation_number !==
+            null
+              ? Number(
+                  card
+                    .last_activation_number
+                )
+              : null,
+
+          hasReturnAudit:
+            Boolean(
+              card
+                .has_return_audit
+            ),
+        };
+
+
+        /*
+         * Nunca permitimos que otro tipo de tarjeta sea
+         * interpretado automáticamente como CUSTOMER.
+         */
+
+        if (
+          card.card_type !==
+          "CUSTOMER"
+        ) {
+
+          return {
+            inspection:
+              "NOT_REUSABLE",
+
+            reason:
+              "UID_REGISTERED_AS_OTHER_CARD_TYPE",
+
+            uid:
+              normalizedUid,
+
+            actor: {
+              role:
+                actorRole,
+
+              cardId:
+                actorCardId,
+
+              rechargePointId,
+            },
+
+            card:
+              cardSnapshot,
+          };
+        }
+
+
+        /*
+         * Una tarjeta en cuarentena financiera jamás debe
+         * reactivarse ni tratarse como segura automáticamente.
+         */
+
+        if (
+          card.financial_hold ===
+          true
+        ) {
+
+          return {
+            inspection:
+              "NOT_REUSABLE",
+
+            reason:
+              "CARD_FINANCIAL_HOLD",
+
+            uid:
+              normalizedUid,
+
+            actor: {
+              role:
+                actorRole,
+
+              cardId:
+                actorCardId,
+
+              rechargePointId,
+            },
+
+            card:
+              cardSnapshot,
+          };
+        }
+
+
+        /*
+         * CUSTOMER activa y coherente.
+         */
+
+        if (
+          card.status ===
+            "ACTIVE" &&
+
+          card
+            .current_activation_id !==
+            null
+        ) {
+
+          return {
+            inspection:
+              "ACTIVE_CUSTOMER",
+
+            reason:
+              null,
+
+            uid:
+              normalizedUid,
+
+            actor: {
+              role:
+                actorRole,
+
+              cardId:
+                actorCardId,
+
+              rechargePointId,
+            },
+
+            card:
+              cardSnapshot,
+          };
+        }
+
+
+        /*
+         * Misma regla estricta que AUTHORIZE utiliza para
+         * reutilizar una CUSTOMER devuelta.
+         */
+
+        const reusable =
+          card.card_type ===
+            "CUSTOMER" &&
+
+          card.status ===
+            "INACTIVE" &&
+
+          Number(
+            card.balance
+          ) ===
+            0 &&
+
+          Number(
+            card
+              .transaction_counter
+          ) ===
+            0 &&
+
+          card
+            .current_activation_id ===
+            null &&
+
+          card
+            .last_activation_id !==
+            null &&
+
+          card
+            .last_activation_status ===
+            "RETURNED" &&
+
+          Boolean(
+            card
+              .has_return_audit
+          );
+
+
+        if (
+          reusable
+        ) {
+
+          return {
+            inspection:
+              "REUSABLE_CUSTOMER",
+
+            reason:
+              null,
+
+            uid:
+              normalizedUid,
+
+            actor: {
+              role:
+                actorRole,
+
+              cardId:
+                actorCardId,
+
+              rechargePointId,
+            },
+
+            card:
+              cardSnapshot,
+          };
+        }
+
+
+        /*
+         * Cualquier otra combinación queda detenida.
+         * No intentamos repararla ni inferir qué ocurrió.
+         */
+
+        return {
+          inspection:
+            "NOT_REUSABLE",
+
+          reason:
+            "CUSTOMER_STATE_NOT_SAFE_FOR_AUTOMATIC_USE",
+
+          uid:
+            normalizedUid,
+
+          actor: {
+            role:
+              actorRole,
+
+            cardId:
+              actorCardId,
+
+            rechargePointId,
+          },
+
+          card:
+            cardSnapshot,
+        };
+
+
+      } catch (
+        error
+      ) {
+
+        server.log.error(
+          error
+        );
+
+
+        return reply
+          .status(500)
+          .send({
+            error:
+              "INTERNAL_ERROR",
+          });
+
+
+      } finally {
+
+        client.release();
+      }
+    }
+  );
+
 
   /*
    * =====================================================
