@@ -69,6 +69,29 @@ type ResumeCheckoutBody = {
 };
 
 
+type ReconcileCheckoutBody = {
+  checkoutId: string;
+  deviceCode: string;
+  targetUid: string;
+
+  /*
+   * NEW:
+   * isVirgin = true significa que Android verificó que la NFC
+   * continúa sin una Meneses Card escrita.
+   *
+   * Si isVirgin = false, Android debe enviar el estado físico
+   * Meneses observado para comparar contra AFTER.
+   *
+   * EXISTING:
+   * siempre requiere cardId / cardBalance / cardCounter.
+   */
+  isVirgin?: boolean;
+  cardId?: number;
+  cardBalance?: number;
+  cardCounter?: number;
+};
+
+
 type ConfirmCheckoutBody = {
   checkoutId: string;
   deviceCode: string;
@@ -2181,11 +2204,15 @@ export async function rechargeCheckoutRoutes(
 
 
           /*
-           * NEW conserva la reservación de card_registrations.
+           * NEW y REUSED conservan una reservación en
+           * card_registrations. En REUSED reserved_card_id es
+           * el mismo card_id físico ya existente.
            */
           if (
             checkout.card_path !==
-            "NEW"
+              "NEW" &&
+            checkout.card_path !==
+              "REUSED"
           ) {
 
             await client.query(
@@ -2365,7 +2392,28 @@ export async function rechargeCheckoutRoutes(
             },
 
             beforeCardState:
-              null,
+              checkout.card_path ===
+                "REUSED"
+                ? {
+                    cardId:
+                      reservedCardId,
+
+                    uid:
+                      normalizedTargetUid,
+
+                    cardType:
+                      "CUSTOMER",
+
+                    status:
+                      "INACTIVE",
+
+                    balance:
+                      0,
+
+                    transactionCounter:
+                      0,
+                  }
+                : null,
 
             finalCardState: {
               cardId:
@@ -2960,6 +3008,436 @@ export async function rechargeCheckoutRoutes(
 
               transactionCounter:
                 counterAfter,
+            },
+          };
+        }
+
+
+        /*
+         * -------------------------------------------------
+         * REUSED CUSTOMER
+         * -------------------------------------------------
+         *
+         * La tarjeta física ya existe, pero su activación anterior
+         * terminó en RETURNED. AUTHORIZE no reactiva todavía cards
+         * ni crea dinero: solamente vuelve a validar el estado
+         * reusable, crea card_registrations PENDING reservando el
+         * MISMO card_id y devuelve BEFORE/AFTER para la NFC.
+         */
+
+        if (
+          checkout.card_path ===
+          "REUSED"
+        ) {
+
+          if (
+            checkout.card_id ===
+              null ||
+            checkout.registration_id !==
+              null ||
+            checkout.recharge_transaction_id !==
+              null ||
+            checkout.activation_transaction_id !==
+              null
+          ) {
+
+            await client.query(
+              "ROLLBACK"
+            );
+
+            return reply
+              .status(409)
+              .send({
+                error:
+                  "REUSED_CHECKOUT_STATE_INVALID",
+              });
+          }
+
+          /* Actor/session sigue activo. */
+          if (
+            checkout.actor_role ===
+            "ADMIN"
+          ) {
+
+            const sessionResult =
+              await client.query(
+                `
+                  select id
+                  from device_admin_sessions
+                  where device_id = $1
+                    and admin_card_id = $2
+                    and status = 'ACTIVE'
+                    and ended_at is null
+                  limit 1
+                  for update
+                `,
+                [
+                  checkout.device_id,
+                  checkout.actor_card_id,
+                ]
+              );
+
+            if (
+              sessionResult.rowCount ===
+              0
+            ) {
+
+              await client.query(
+                "ROLLBACK"
+              );
+
+              return reply
+                .status(403)
+                .send({
+                  error:
+                    "ADMIN_SESSION_NO_LONGER_ACTIVE",
+                });
+            }
+
+          } else if (
+            checkout.actor_role ===
+            "RECHARGE"
+          ) {
+
+            const sessionResult =
+              await client.query(
+                `
+                  select id
+                  from device_recharge_sessions
+                  where device_id = $1
+                    and opened_by_card_id = $2
+                    and recharge_point_id = $3
+                    and status = 'ACTIVE'
+                    and ended_at is null
+                  limit 1
+                  for update
+                `,
+                [
+                  checkout.device_id,
+                  checkout.actor_card_id,
+                  checkout.recharge_point_id,
+                ]
+              );
+
+            if (
+              sessionResult.rowCount ===
+              0
+            ) {
+
+              await client.query(
+                "ROLLBACK"
+              );
+
+              return reply
+                .status(403)
+                .send({
+                  error:
+                    "RECHARGE_SESSION_NO_LONGER_ACTIVE",
+                });
+            }
+
+          } else {
+
+            await client.query(
+              "ROLLBACK"
+            );
+
+            return reply
+              .status(409)
+              .send({
+                error:
+                  "UNKNOWN_CHECKOUT_ACTOR",
+              });
+          }
+
+          const reusableCardResult =
+            await client.query(
+              `
+                select
+                    c.card_id,
+                    c.uid,
+                    c.card_type,
+                    c.status,
+                    c.balance,
+                    c.transaction_counter,
+                    c.current_activation_id,
+                    c.financial_hold,
+                    c.financial_hold_reason,
+                    c.financial_hold_at,
+                    last_activation.id as last_activation_id,
+                    last_activation.status as last_activation_status,
+                    last_activation.activation_number as last_activation_number,
+                    (r.id is not null) as has_return_audit
+                from cards c
+                left join lateral (
+                  select id, status, activation_number
+                  from customer_card_activations
+                  where card_id = c.card_id
+                  order by activation_number desc
+                  limit 1
+                ) last_activation on true
+                left join customer_card_returns r
+                  on r.activation_id = last_activation.id
+                where c.card_id = $1
+                for update of c
+              `,
+              [
+                checkout.card_id,
+              ]
+            );
+
+          if (
+            reusableCardResult.rowCount ===
+            0
+          ) {
+
+            await client.query(
+              "ROLLBACK"
+            );
+
+            return reply
+              .status(404)
+              .send({
+                error:
+                  "CARD_NOT_FOUND",
+              });
+          }
+
+          const reusableCard =
+            reusableCardResult.rows[0];
+
+          if (
+            reusableCard.financial_hold ===
+            true
+          ) {
+
+            await client.query(
+              "ROLLBACK"
+            );
+
+            return reply
+              .status(409)
+              .send({
+                error:
+                  "CARD_FINANCIAL_HOLD",
+                reason:
+                  reusableCard.financial_hold_reason ??
+                  "MANUAL_REVIEW_REQUIRED",
+                heldAt:
+                  reusableCard.financial_hold_at,
+              });
+          }
+
+          const reusable =
+            normalizeUid(
+              reusableCard.uid
+            ) ===
+              normalizedTargetUid &&
+            reusableCard.card_type ===
+              "CUSTOMER" &&
+            reusableCard.status ===
+              "INACTIVE" &&
+            Number(
+              reusableCard.balance
+            ) ===
+              0 &&
+            Number(
+              reusableCard.transaction_counter
+            ) ===
+              0 &&
+            reusableCard.current_activation_id ===
+              null &&
+            reusableCard.last_activation_id !==
+              null &&
+            reusableCard.last_activation_status ===
+              "RETURNED" &&
+            Boolean(
+              reusableCard.has_return_audit
+            );
+
+          if (
+            !reusable
+          ) {
+
+            await client.query(
+              "ROLLBACK"
+            );
+
+            return reply
+              .status(409)
+              .send({
+                error:
+                  "CARD_NOT_REUSABLE",
+              });
+          }
+
+          const pendingRegistrationResult =
+            await client.query(
+              `
+                select id, reserved_card_id
+                from card_registrations
+                where upper(target_uid) = upper($1)
+                  and status = 'PENDING'
+                order by created_at desc
+                limit 1
+              `,
+              [
+                normalizedTargetUid,
+              ]
+            );
+
+          if (
+            pendingRegistrationResult.rowCount &&
+            pendingRegistrationResult.rowCount >
+              0
+          ) {
+
+            await client.query(
+              "ROLLBACK"
+            );
+
+            return reply
+              .status(409)
+              .send({
+                error:
+                  "UID_HAS_PENDING_REGISTRATION",
+                registrationId:
+                  pendingRegistrationResult.rows[0].id,
+                cardId:
+                  Number(
+                    pendingRegistrationResult.rows[0].reserved_card_id
+                  ),
+              });
+          }
+
+          const registrationIdempotencyKey =
+            `checkout:${checkout.id}:registration`;
+
+          const registrationResult =
+            await client.query(
+              `
+                insert into card_registrations (
+                    idempotency_key,
+                    device_id,
+                    admin_card_id,
+                    actor_role,
+                    actor_card_id,
+                    recharge_point_id,
+                    target_uid,
+                    target_card_type,
+                    reserved_card_id,
+                    status
+                )
+                values (
+                    $1,
+                    $2,
+                    $3,
+                    $4,
+                    $5,
+                    $6,
+                    $7,
+                    'CUSTOMER',
+                    $8,
+                    'PENDING'
+                )
+                returning *
+              `,
+              [
+                registrationIdempotencyKey,
+                checkout.device_id,
+                checkout.actor_role ===
+                  "ADMIN"
+                  ? checkout.actor_card_id
+                  : null,
+                checkout.actor_role,
+                checkout.actor_card_id,
+                checkout.recharge_point_id,
+                normalizedTargetUid,
+                Number(
+                  checkout.card_id
+                ),
+              ]
+            );
+
+          const registration =
+            registrationResult.rows[0];
+
+          const updatedCheckoutResult =
+            await client.query(
+              `
+                update recharge_checkouts
+                set
+                    registration_id = $2,
+                    status = 'IN_PROGRESS',
+                    updated_at = now()
+                where id = $1
+                returning *
+              `,
+              [
+                checkout.id,
+                registration.id,
+              ]
+            );
+
+          const updatedCheckout =
+            updatedCheckoutResult.rows[0];
+
+          await client.query(
+            "COMMIT"
+          );
+
+          return {
+            authorized:
+              true,
+            duplicated:
+              false,
+            checkout:
+              mapCheckoutRow(
+                updatedCheckout
+              ),
+            registration: {
+              registrationId:
+                registration.id,
+              status:
+                registration.status,
+              reservedCardId:
+                Number(
+                  checkout.card_id
+                ),
+            },
+            beforeCardState: {
+              cardId:
+                Number(
+                  checkout.card_id
+                ),
+              uid:
+                normalizedTargetUid,
+              cardType:
+                "CUSTOMER",
+              status:
+                "INACTIVE",
+              balance:
+                0,
+              transactionCounter:
+                0,
+            },
+            finalCardState: {
+              cardId:
+                Number(
+                  checkout.card_id
+                ),
+              uid:
+                normalizedTargetUid,
+              cardType:
+                "CUSTOMER",
+              status:
+                "ACTIVE",
+              balance:
+                Number(
+                  updatedCheckout.credited_amount
+                ),
+              transactionCounter:
+                1,
             },
           };
         }
@@ -3945,7 +4423,9 @@ export async function rechargeCheckoutRoutes(
 
         if (
           checkout.card_path !==
-          "NEW"
+            "NEW" &&
+          checkout.card_path !==
+            "REUSED"
         ) {
 
           return reply
@@ -4097,7 +4577,23 @@ export async function rechargeCheckoutRoutes(
           },
 
           beforeCardState:
-            null,
+            checkout.card_path ===
+              "REUSED"
+              ? {
+                  cardId:
+                    reservedCardId,
+                  uid:
+                    normalizedTargetUid,
+                  cardType:
+                    "CUSTOMER",
+                  status:
+                    "INACTIVE",
+                  balance:
+                    0,
+                  transactionCounter:
+                    0,
+                }
+              : null,
 
           finalCardState: {
             cardId:
@@ -4126,6 +4622,2276 @@ export async function rechargeCheckoutRoutes(
       } catch (
         error: any
       ) {
+
+        server.log.error(
+          error
+        );
+
+
+        return reply
+          .status(500)
+          .send({
+            error:
+              "INTERNAL_ERROR",
+          });
+
+
+      } finally {
+
+        client.release();
+      }
+    }
+  );
+
+
+  /*
+   * =====================================================
+   * RECONCILE CHECKOUT
+   * =====================================================
+   *
+   * POST /recharge-checkouts/reconcile
+   *
+   * Recuperación checkout-aware después de una interrupción.
+   *
+   * IMPORTANTE:
+   * - nunca decide por timeout;
+   * - nunca inventa el estado físico;
+   * - AFTER no se vuelve a escribir: Android debe llamar /confirm;
+   * - BEFORE libera la operación de forma explícita;
+   * - un tercer estado entra en MANUAL_REVIEW_REQUIRED.
+   *
+   * EXISTING:
+   *   BEFORE -> transaction FAILED + checkout FAILED.
+   *   AFTER  -> CONFIRM_REQUIRED.
+   *   otro   -> incidente forense + REVERSAL_REQUIRED +
+   *             financial_hold + checkout MANUAL_REVIEW_REQUIRED.
+   *
+   * NEW:
+   *   virgen -> registration FAILED + checkout FAILED.
+   *   AFTER  -> CONFIRM_REQUIRED.
+   *   otro   -> checkout MANUAL_REVIEW_REQUIRED.
+   *
+   * Para NEW todavía no existe una fila cards ni una transaction antes
+   * de /confirm. Por eso un estado físico inesperado NO crea una fila
+   * falsa en cards ni un card_financial_incident artificial. El checkout
+   * y la reservación quedan preservados para revisión manual.
+   * =====================================================
+   */
+
+  server.post<{
+    Body: ReconcileCheckoutBody;
+  }>(
+    "/recharge-checkouts/reconcile",
+
+    async (request, reply) => {
+
+      const {
+        checkoutId,
+        deviceCode,
+        targetUid,
+        isVirgin,
+        cardId,
+        cardBalance,
+        cardCounter,
+      } = request.body;
+
+
+      if (
+        !isNonEmptyString(
+          checkoutId
+        )
+      ) {
+
+        return reply
+          .status(400)
+          .send({
+            error:
+              "INVALID_CHECKOUT_ID",
+          });
+      }
+
+
+      if (
+        !isNonEmptyString(
+          deviceCode
+        )
+      ) {
+
+        return reply
+          .status(400)
+          .send({
+            error:
+              "INVALID_DEVICE_CODE",
+          });
+      }
+
+
+      if (
+        !isNonEmptyString(
+          targetUid
+        )
+      ) {
+
+        return reply
+          .status(400)
+          .send({
+            error:
+              "INVALID_TARGET_UID",
+          });
+      }
+
+
+      const normalizedCheckoutId =
+        checkoutId.trim();
+
+
+      const normalizedDeviceCode =
+        deviceCode.trim();
+
+
+      const normalizedTargetUid =
+        normalizeUid(
+          targetUid
+        );
+
+
+      const client =
+        await db.connect();
+
+
+      try {
+
+        await client.query(
+          "BEGIN"
+        );
+
+
+        /*
+         * -------------------------------------------------
+         * CHECKOUT + DEVICE
+         * -------------------------------------------------
+         */
+
+        const checkoutResult =
+          await client.query(
+            `
+              select
+                  c.*,
+                  d.device_code,
+                  d.status
+                    as device_status
+
+              from recharge_checkouts c
+
+              join devices d
+                  on d.id =
+                     c.device_id
+
+              where c.id = $1
+
+              limit 1
+
+              for update of c
+            `,
+            [
+              normalizedCheckoutId,
+            ]
+          );
+
+
+        if (
+          checkoutResult.rowCount ===
+          0
+        ) {
+
+          await client.query(
+            "ROLLBACK"
+          );
+
+
+          return reply
+            .status(404)
+            .send({
+              error:
+                "RECHARGE_CHECKOUT_NOT_FOUND",
+            });
+        }
+
+
+        const checkout =
+          checkoutResult.rows[0];
+
+
+        if (
+          checkout.device_code !==
+          normalizedDeviceCode
+        ) {
+
+          await client.query(
+            "ROLLBACK"
+          );
+
+
+          return reply
+            .status(409)
+            .send({
+              error:
+                "CHECKOUT_DEVICE_MISMATCH",
+            });
+        }
+
+
+        if (
+          checkout.device_status !==
+          "ACTIVE"
+        ) {
+
+          await client.query(
+            "ROLLBACK"
+          );
+
+
+          return reply
+            .status(409)
+            .send({
+              error:
+                "DEVICE_NOT_ACTIVE",
+            });
+        }
+
+
+        if (
+          normalizeUid(
+            String(
+              checkout.target_uid
+            )
+          ) !==
+          normalizedTargetUid
+        ) {
+
+          await client.query(
+            "ROLLBACK"
+          );
+
+
+          return reply
+            .status(409)
+            .send({
+              error:
+                "CHECKOUT_UID_MISMATCH",
+            });
+        }
+
+
+        /*
+         * -------------------------------------------------
+         * ESTADOS TERMINALES / PREPARED
+         * -------------------------------------------------
+         */
+
+        if (
+          checkout.status ===
+          "CONFIRMED"
+        ) {
+
+          await client.query(
+            "COMMIT"
+          );
+
+
+          return {
+            reconciled:
+              true,
+
+            action:
+              "ALREADY_CONFIRMED",
+
+            checkout:
+              mapCheckoutRow(
+                checkout
+              ),
+          };
+        }
+
+
+        if (
+          checkout.status ===
+          "FAILED"
+        ) {
+
+          await client.query(
+            "COMMIT"
+          );
+
+
+          return {
+            reconciled:
+              true,
+
+            action:
+              "ALREADY_FAILED",
+
+            checkout:
+              mapCheckoutRow(
+                checkout
+              ),
+          };
+        }
+
+
+        if (
+          checkout.status ===
+          "MANUAL_REVIEW_REQUIRED"
+        ) {
+
+          await client.query(
+            "COMMIT"
+          );
+
+
+          return reply
+            .status(409)
+            .send({
+              error:
+                "MANUAL_REVIEW_REQUIRED",
+
+              checkout:
+                mapCheckoutRow(
+                  checkout
+                ),
+            });
+        }
+
+
+        if (
+          checkout.status ===
+          "PENDING"
+        ) {
+
+          await client.query(
+            "COMMIT"
+          );
+
+
+          return {
+            reconciled:
+              false,
+
+            action:
+              "CHECKOUT_STILL_PREPARED",
+
+            checkout:
+              mapCheckoutRow(
+                checkout
+              ),
+          };
+        }
+
+
+        if (
+          checkout.status !==
+          "IN_PROGRESS"
+        ) {
+
+          await client.query(
+            "ROLLBACK"
+          );
+
+
+          return reply
+            .status(409)
+            .send({
+              error:
+                "CHECKOUT_STATE_NOT_RECONCILABLE",
+
+              status:
+                checkout.status,
+            });
+        }
+
+
+        /*
+         * -------------------------------------------------
+         * REUSED CUSTOMER
+         * -------------------------------------------------
+         *
+         * BEFORE físico = misma CUSTOMER devuelta 0/0.
+         * AFTER físico  = misma CUSTOMER ACTIVE con crédito/1.
+         * PostgreSQL debe seguir en BEFORE hasta /confirm.
+         */
+
+        if (
+          checkout.card_path ===
+          "REUSED"
+        ) {
+
+          if (
+            checkout.card_id ===
+              null ||
+            checkout.registration_id ===
+              null ||
+            checkout.recharge_transaction_id !==
+              null ||
+            checkout.activation_transaction_id !==
+              null
+          ) {
+
+            await client.query(
+              "ROLLBACK"
+            );
+
+            return reply
+              .status(409)
+              .send({
+                error:
+                  "REUSED_CHECKOUT_STATE_INVALID",
+              });
+          }
+
+          const registrationResult =
+            await client.query(
+              `
+                select *
+                from card_registrations
+                where id = $1
+                for update
+              `,
+              [
+                checkout.registration_id,
+              ]
+            );
+
+          if (
+            registrationResult.rowCount ===
+            0
+          ) {
+
+            await client.query(
+              "ROLLBACK"
+            );
+
+            return reply
+              .status(409)
+              .send({
+                error:
+                  "CHECKOUT_REGISTRATION_NOT_FOUND",
+              });
+          }
+
+          const registration =
+            registrationResult.rows[0];
+
+          if (
+            registration.status !==
+              "PENDING" ||
+            normalizeUid(
+              registration.target_uid
+            ) !==
+              normalizedTargetUid ||
+            registration.target_card_type !==
+              "CUSTOMER" ||
+            Number(
+              registration.reserved_card_id
+            ) !==
+              Number(
+                checkout.card_id
+              )
+          ) {
+
+            await client.query(
+              "ROLLBACK"
+            );
+
+            return reply
+              .status(409)
+              .send({
+                error:
+                  "CHECKOUT_REGISTRATION_STATE_MISMATCH",
+              });
+          }
+
+          const reusableCardResult =
+            await client.query(
+              `
+                select
+                    c.card_id,
+                    c.uid,
+                    c.card_type,
+                    c.status,
+                    c.balance,
+                    c.transaction_counter,
+                    c.current_activation_id,
+                    c.financial_hold,
+                    c.financial_hold_reason,
+                    c.financial_hold_at,
+                    last_activation.id as last_activation_id,
+                    last_activation.status as last_activation_status,
+                    (r.id is not null) as has_return_audit
+                from cards c
+                left join lateral (
+                  select id, status, activation_number
+                  from customer_card_activations
+                  where card_id = c.card_id
+                  order by activation_number desc
+                  limit 1
+                ) last_activation on true
+                left join customer_card_returns r
+                  on r.activation_id = last_activation.id
+                where c.card_id = $1
+                for update of c
+              `,
+              [
+                checkout.card_id,
+              ]
+            );
+
+          if (
+            reusableCardResult.rowCount ===
+            0
+          ) {
+
+            await client.query(
+              "ROLLBACK"
+            );
+
+            return reply
+              .status(404)
+              .send({
+                error:
+                  "CARD_NOT_FOUND",
+              });
+          }
+
+          const reusableCard =
+            reusableCardResult.rows[0];
+
+          const serverIsBefore =
+            normalizeUid(
+              reusableCard.uid
+            ) ===
+              normalizedTargetUid &&
+            reusableCard.card_type ===
+              "CUSTOMER" &&
+            reusableCard.status ===
+              "INACTIVE" &&
+            Number(
+              reusableCard.balance
+            ) ===
+              0 &&
+            Number(
+              reusableCard.transaction_counter
+            ) ===
+              0 &&
+            reusableCard.current_activation_id ===
+              null &&
+            reusableCard.last_activation_id !==
+              null &&
+            reusableCard.last_activation_status ===
+              "RETURNED" &&
+            Boolean(
+              reusableCard.has_return_audit
+            ) &&
+            reusableCard.financial_hold !==
+              true;
+
+          if (
+            !serverIsBefore
+          ) {
+
+            await client.query(
+              "ROLLBACK"
+            );
+
+            return reply
+              .status(409)
+              .send({
+                error:
+                  "REUSED_SERVER_STATE_MISMATCH",
+              });
+          }
+
+          if (
+            isVirgin ===
+            true
+          ) {
+
+            const manualCheckoutResult =
+              await client.query(
+                `
+                  update recharge_checkouts
+                  set
+                      status = 'MANUAL_REVIEW_REQUIRED',
+                      failure_reason = 'Reconciliación checkout REUSED: Android reportó NFC virgen.',
+                      updated_at = now()
+                  where id = $1
+                  returning *
+                `,
+                [
+                  checkout.id,
+                ]
+              );
+
+            await client.query(
+              `
+                update cards
+                set
+                    financial_hold = true,
+                    financial_hold_reason = 'MANUAL_REVIEW_REQUIRED',
+                    financial_hold_at = coalesce(financial_hold_at, now()),
+                    updated_at = now()
+                where card_id = $1
+              `,
+              [
+                checkout.card_id,
+              ]
+            );
+
+            await client.query(
+              "COMMIT"
+            );
+
+            return reply
+              .status(409)
+              .send({
+                error:
+                  "MANUAL_REVIEW_REQUIRED",
+                reason:
+                  "REUSED_CARD_OBSERVED_AS_VIRGIN",
+                financialHold:
+                  true,
+                checkout:
+                  mapCheckoutRow(
+                    manualCheckoutResult.rows[0]
+                  ),
+              });
+          }
+
+          if (
+            !Number.isSafeInteger(
+              cardId
+            ) ||
+            Number(cardId) <=
+              0 ||
+            !Number.isSafeInteger(
+              cardBalance
+            ) ||
+            Number(cardBalance) <
+              0 ||
+            !Number.isSafeInteger(
+              cardCounter
+            ) ||
+            Number(cardCounter) <
+              0
+          ) {
+
+            await client.query(
+              "ROLLBACK"
+            );
+
+            return reply
+              .status(400)
+              .send({
+                error:
+                  "REUSED_OBSERVED_CARD_STATE_REQUIRED",
+              });
+          }
+
+          const expectedCardId =
+            Number(
+              checkout.card_id
+            );
+          const expectedAfterBalance =
+            Number(
+              checkout.credited_amount
+            );
+          const expectedAfterCounter =
+            1;
+
+          const observedIsBefore =
+            Number(cardId) ===
+              expectedCardId &&
+            Number(cardBalance) ===
+              0 &&
+            Number(cardCounter) ===
+              0;
+
+          const observedIsAfter =
+            Number(cardId) ===
+              expectedCardId &&
+            Number(cardBalance) ===
+              expectedAfterBalance &&
+            Number(cardCounter) ===
+              expectedAfterCounter;
+
+          if (
+            observedIsAfter
+          ) {
+
+            await client.query(
+              "COMMIT"
+            );
+
+            return {
+              reconciled:
+                false,
+              action:
+                "CONFIRM_REQUIRED",
+              cardPath:
+                "REUSED",
+              checkoutId:
+                checkout.id,
+              registrationId:
+                registration.id,
+              expectedAfter: {
+                cardId:
+                  expectedCardId,
+                balance:
+                  expectedAfterBalance,
+                transactionCounter:
+                  expectedAfterCounter,
+              },
+              checkout:
+                mapCheckoutRow(
+                  checkout
+                ),
+            };
+          }
+
+          if (
+            observedIsBefore
+          ) {
+
+            await client.query(
+              `
+                update card_registrations
+                set
+                    status = 'FAILED',
+                    failed_at = coalesce(failed_at, now()),
+                    failure_reason = 'Reconciliación checkout REUSED: la NFC permaneció en estado devuelto 0/0.'
+                where id = $1
+              `,
+              [
+                registration.id,
+              ]
+            );
+
+            const failedCheckoutResult =
+              await client.query(
+                `
+                  update recharge_checkouts
+                  set
+                      status = 'FAILED',
+                      failed_at = coalesce(failed_at, now()),
+                      failure_reason = 'Reconciliación checkout REUSED: la NFC permaneció en estado devuelto 0/0.',
+                      updated_at = now()
+                  where id = $1
+                  returning *
+                `,
+                [
+                  checkout.id,
+                ]
+              );
+
+            await client.query(
+              "COMMIT"
+            );
+
+            return {
+              reconciled:
+                true,
+              action:
+                "FAILED_REUSED_CHECKOUT_BEFORE_WRITE",
+              registrationId:
+                registration.id,
+              cardId:
+                expectedCardId,
+              balance:
+                0,
+              transactionCounter:
+                0,
+              checkout:
+                mapCheckoutRow(
+                  failedCheckoutResult.rows[0]
+                ),
+            };
+          }
+
+          await client.query(
+            `
+              update cards
+              set
+                  financial_hold = true,
+                  financial_hold_reason = 'MANUAL_REVIEW_REQUIRED',
+                  financial_hold_at = coalesce(financial_hold_at, now()),
+                  updated_at = now()
+              where card_id = $1
+            `,
+            [
+              checkout.card_id,
+            ]
+          );
+
+          const manualCheckoutResult =
+            await client.query(
+              `
+                update recharge_checkouts
+                set
+                    status = 'MANUAL_REVIEW_REQUIRED',
+                    failure_reason = 'Reconciliación checkout REUSED: estado físico inesperado.',
+                    updated_at = now()
+                where id = $1
+                returning *
+              `,
+              [
+                checkout.id,
+              ]
+            );
+
+          await client.query(
+            "COMMIT"
+          );
+
+          return reply
+            .status(409)
+            .send({
+              error:
+                "MANUAL_REVIEW_REQUIRED",
+              reason:
+                "REUSED_CARD_STATE_MISMATCH",
+              financialHold:
+                true,
+              expectedBefore: {
+                cardId:
+                  expectedCardId,
+                balance:
+                  0,
+                transactionCounter:
+                  0,
+              },
+              expectedAfter: {
+                cardId:
+                  expectedCardId,
+                balance:
+                  expectedAfterBalance,
+                transactionCounter:
+                  expectedAfterCounter,
+              },
+              observedCardState: {
+                cardId:
+                  Number(cardId),
+                balance:
+                  Number(cardBalance),
+                transactionCounter:
+                  Number(cardCounter),
+              },
+              checkout:
+                mapCheckoutRow(
+                  manualCheckoutResult.rows[0]
+                ),
+            });
+        }
+
+
+        /*
+         * -------------------------------------------------
+         * NEW CUSTOMER
+         * -------------------------------------------------
+         */
+
+        if (
+          checkout.card_path ===
+          "NEW"
+        ) {
+
+          if (
+            checkout.registration_id ===
+              null ||
+            checkout.card_id !==
+              null
+          ) {
+
+            await client.query(
+              "ROLLBACK"
+            );
+
+
+            return reply
+              .status(409)
+              .send({
+                error:
+                  "NEW_CHECKOUT_STATE_INVALID",
+              });
+          }
+
+
+          const registrationResult =
+            await client.query(
+              `
+                select *
+                from card_registrations
+                where id = $1
+                for update
+              `,
+              [
+                checkout.registration_id,
+              ]
+            );
+
+
+          if (
+            registrationResult.rowCount ===
+            0
+          ) {
+
+            await client.query(
+              "ROLLBACK"
+            );
+
+
+            return reply
+              .status(409)
+              .send({
+                error:
+                  "CHECKOUT_REGISTRATION_NOT_FOUND",
+              });
+          }
+
+
+          const registration =
+            registrationResult.rows[0];
+
+
+          const reservedCardId =
+            Number(
+              registration.reserved_card_id
+            );
+
+
+          if (
+            registration.status !==
+              "PENDING" ||
+            normalizeUid(
+              String(
+                registration.target_uid
+              )
+            ) !==
+              normalizedTargetUid ||
+            registration.target_card_type !==
+              "CUSTOMER" ||
+            !Number.isSafeInteger(
+              reservedCardId
+            ) ||
+            reservedCardId <=
+              0
+          ) {
+
+            await client.query(
+              "ROLLBACK"
+            );
+
+
+            return reply
+              .status(409)
+              .send({
+                error:
+                  "CHECKOUT_REGISTRATION_STATE_MISMATCH",
+              });
+          }
+
+
+          /*
+           * NFC continúa virgen.
+           *
+           * Antes de liberar la reservación comprobamos que no exista
+           * una CUSTOMER materializada con ese card_id o UID.
+           */
+
+          if (
+            isVirgin ===
+            true
+          ) {
+
+            const materializedCardResult =
+              await client.query(
+                `
+                  select
+                      card_id,
+                      uid,
+                      balance,
+                      transaction_counter
+
+                  from cards
+
+                  where card_id = $1
+                     or upper(uid) =
+                        upper($2)
+
+                  limit 1
+
+                  for update
+                `,
+                [
+                  reservedCardId,
+                  normalizedTargetUid,
+                ]
+              );
+
+
+            if (
+              materializedCardResult.rowCount &&
+              materializedCardResult.rowCount >
+                0
+            ) {
+
+              const manualCheckoutResult =
+                await client.query(
+                  `
+                    update recharge_checkouts
+                    set
+                        status =
+                          'MANUAL_REVIEW_REQUIRED',
+                        failure_reason =
+                          'Reconciliación checkout NEW: Android reportó NFC virgen pero ya existe una tarjeta materializada.',
+                        updated_at =
+                          now()
+                    where id = $1
+                    returning *
+                  `,
+                  [
+                    checkout.id,
+                  ]
+                );
+
+
+              await client.query(
+                "COMMIT"
+              );
+
+
+              return reply
+                .status(409)
+                .send({
+                  error:
+                    "MANUAL_REVIEW_REQUIRED",
+
+                  reason:
+                    "NEW_VIRGIN_BUT_CARD_ALREADY_MATERIALIZED",
+
+                  checkout:
+                    mapCheckoutRow(
+                      manualCheckoutResult
+                        .rows[0]
+                    ),
+                });
+            }
+
+
+            await client.query(
+              `
+                update card_registrations
+                set
+                    status = 'FAILED',
+                    failed_at =
+                      coalesce(
+                        failed_at,
+                        now()
+                      ),
+                    failure_reason =
+                      'Reconciliación checkout: la NFC permaneció virgen.'
+                where id = $1
+              `,
+              [
+                registration.id,
+              ]
+            );
+
+
+            const failedCheckoutResult =
+              await client.query(
+                `
+                  update recharge_checkouts
+                  set
+                      status = 'FAILED',
+                      failed_at =
+                        coalesce(
+                          failed_at,
+                          now()
+                        ),
+                      failure_reason =
+                        'Reconciliación checkout: la NFC permaneció virgen.',
+                      updated_at =
+                        now()
+                  where id = $1
+                  returning *
+                `,
+                [
+                  checkout.id,
+                ]
+              );
+
+
+            await client.query(
+              "COMMIT"
+            );
+
+
+            return {
+              reconciled:
+                true,
+
+              action:
+                "FAILED_NEW_CHECKOUT_BEFORE_WRITE",
+
+              registrationId:
+                registration.id,
+
+              reservedCardId,
+
+              checkout:
+                mapCheckoutRow(
+                  failedCheckoutResult
+                    .rows[0]
+                ),
+            };
+          }
+
+
+          /*
+           * Si Android no reporta virgen debe entregar un estado físico
+           * Meneses completo.
+           */
+
+          if (
+            !Number.isSafeInteger(
+              cardId
+            ) ||
+            Number(
+              cardId
+            ) <=
+              0 ||
+            !Number.isSafeInteger(
+              cardBalance
+            ) ||
+            Number(
+              cardBalance
+            ) <
+              0 ||
+            !Number.isSafeInteger(
+              cardCounter
+            ) ||
+            Number(
+              cardCounter
+            ) <
+              0
+          ) {
+
+            await client.query(
+              "ROLLBACK"
+            );
+
+
+            return reply
+              .status(400)
+              .send({
+                error:
+                  "NEW_OBSERVED_CARD_STATE_REQUIRED",
+              });
+          }
+
+
+          const expectedBalance =
+            Number(
+              checkout.credited_amount
+            );
+
+
+          const expectedCounter =
+            1;
+
+
+          const observedIsAfter =
+            Number(
+              cardId
+            ) ===
+              reservedCardId &&
+            Number(
+              cardBalance
+            ) ===
+              expectedBalance &&
+            Number(
+              cardCounter
+            ) ===
+              expectedCounter;
+
+
+          if (
+            observedIsAfter
+          ) {
+
+            await client.query(
+              "COMMIT"
+            );
+
+
+            return {
+              reconciled:
+                false,
+
+              action:
+                "CONFIRM_REQUIRED",
+
+              cardPath:
+                "NEW",
+
+              checkoutId:
+                checkout.id,
+
+              registrationId:
+                registration.id,
+
+              expectedAfter: {
+                cardId:
+                  reservedCardId,
+
+                balance:
+                  expectedBalance,
+
+                transactionCounter:
+                  expectedCounter,
+              },
+
+              checkout:
+                mapCheckoutRow(
+                  checkout
+                ),
+            };
+          }
+
+
+          /*
+           * NEW inesperado:
+           *
+           * No existe aún transaction ni cards row válida sobre la cual
+           * aplicar financial_hold. Preservamos checkout + registration
+           * y bloqueamos ese UID vía el índice de checkout abierto.
+           */
+
+          const manualCheckoutResult =
+            await client.query(
+              `
+                update recharge_checkouts
+                set
+                    status =
+                      'MANUAL_REVIEW_REQUIRED',
+                    failure_reason =
+                      'Reconciliación checkout NEW: estado físico inesperado.',
+                    updated_at =
+                      now()
+                where id = $1
+                returning *
+              `,
+              [
+                checkout.id,
+              ]
+            );
+
+
+          await client.query(
+            "COMMIT"
+          );
+
+
+          return reply
+            .status(409)
+            .send({
+              error:
+                "MANUAL_REVIEW_REQUIRED",
+
+              reason:
+                "NEW_CARD_STATE_MISMATCH",
+
+              financialHold:
+                false,
+
+              note:
+                "No se creó una fila cards ni un incidente financiero artificial; checkout y registration quedan preservados.",
+
+              expectedAfter: {
+                cardId:
+                  reservedCardId,
+
+                balance:
+                  expectedBalance,
+
+                transactionCounter:
+                  expectedCounter,
+              },
+
+              observedCardState: {
+                cardId:
+                  Number(
+                    cardId
+                  ),
+
+                balance:
+                  Number(
+                    cardBalance
+                  ),
+
+                transactionCounter:
+                  Number(
+                    cardCounter
+                  ),
+              },
+
+              checkout:
+                mapCheckoutRow(
+                  manualCheckoutResult
+                    .rows[0]
+                ),
+            });
+        }
+
+
+        /*
+         * -------------------------------------------------
+         * EXISTING CUSTOMER
+         * -------------------------------------------------
+         */
+
+        if (
+          checkout.card_path ===
+          "EXISTING"
+        ) {
+
+          if (
+            checkout.card_id ===
+              null ||
+            checkout.recharge_transaction_id ===
+              null ||
+            checkout.registration_id !==
+              null
+          ) {
+
+            await client.query(
+              "ROLLBACK"
+            );
+
+
+            return reply
+              .status(409)
+              .send({
+                error:
+                  "EXISTING_CHECKOUT_STATE_INVALID",
+              });
+          }
+
+
+          if (
+            isVirgin ===
+              true ||
+            !Number.isSafeInteger(
+              cardId
+            ) ||
+            Number(
+              cardId
+            ) <=
+              0 ||
+            !Number.isSafeInteger(
+              cardBalance
+            ) ||
+            Number(
+              cardBalance
+            ) <
+              0 ||
+            !Number.isSafeInteger(
+              cardCounter
+            ) ||
+            Number(
+              cardCounter
+            ) <
+              0
+          ) {
+
+            await client.query(
+              "ROLLBACK"
+            );
+
+
+            return reply
+              .status(400)
+              .send({
+                error:
+                  "EXISTING_OBSERVED_CARD_STATE_REQUIRED",
+              });
+          }
+
+
+          const existingCardResult =
+            await client.query(
+              `
+                select
+                    card_id,
+                    uid,
+                    card_type,
+                    status,
+                    balance,
+                    transaction_counter,
+                    current_activation_id,
+                    financial_hold,
+                    financial_hold_reason,
+                    financial_hold_at
+
+                from cards
+
+                where card_id = $1
+
+                for update
+              `,
+              [
+                checkout.card_id,
+              ]
+            );
+
+
+          if (
+            existingCardResult.rowCount ===
+            0
+          ) {
+
+            await client.query(
+              "ROLLBACK"
+            );
+
+
+            return reply
+              .status(404)
+              .send({
+                error:
+                  "CARD_NOT_FOUND",
+              });
+          }
+
+
+          const existingCard =
+            existingCardResult.rows[0];
+
+
+          if (
+            normalizeUid(
+              String(
+                existingCard.uid
+              )
+            ) !==
+              normalizedTargetUid ||
+            existingCard.card_type !==
+              "CUSTOMER" ||
+            existingCard.status !==
+              "ACTIVE" ||
+            existingCard.current_activation_id ===
+              null ||
+            Number(
+              existingCard.card_id
+            ) !==
+              Number(
+                checkout.card_id
+              )
+          ) {
+
+            await client.query(
+              "ROLLBACK"
+            );
+
+
+            return reply
+              .status(409)
+              .send({
+                error:
+                  "EXISTING_CUSTOMER_STATE_INVALID",
+              });
+          }
+
+
+          const transactionResult =
+            await client.query(
+              `
+                select *
+                from transactions
+                where id = $1
+                for update
+              `,
+              [
+                checkout.recharge_transaction_id,
+              ]
+            );
+
+
+          if (
+            transactionResult.rowCount ===
+            0
+          ) {
+
+            await client.query(
+              "ROLLBACK"
+            );
+
+
+            return reply
+              .status(409)
+              .send({
+                error:
+                  "CHECKOUT_RECHARGE_TRANSACTION_NOT_FOUND",
+              });
+          }
+
+
+          const transaction =
+            transactionResult.rows[0];
+
+
+          if (
+            Number(
+              transaction.card_id
+            ) !==
+              Number(
+                checkout.card_id
+              ) ||
+            transaction.transaction_type !==
+              "RECHARGE" ||
+            String(
+              transaction.activation_id
+            ) !==
+              String(
+                existingCard.current_activation_id
+              )
+          ) {
+
+            await client.query(
+              "ROLLBACK"
+            );
+
+
+            return reply
+              .status(409)
+              .send({
+                error:
+                  "CHECKOUT_RECHARGE_TRANSACTION_STATE_MISMATCH",
+              });
+          }
+
+
+          const serverBalance =
+            Number(
+              existingCard.balance
+            );
+
+
+          const serverCounter =
+            Number(
+              existingCard.transaction_counter
+            );
+
+
+          const balanceBefore =
+            Number(
+              transaction.balance_before
+            );
+
+
+          const counterBefore =
+            Number(
+              transaction.counter_before
+            );
+
+
+          const balanceAfter =
+            Number(
+              transaction.balance_after
+            );
+
+
+          const counterAfter =
+            Number(
+              transaction.counter_after
+            );
+
+
+          const observedCardId =
+            Number(
+              cardId
+            );
+
+
+          const observedBalance =
+            Number(
+              cardBalance
+            );
+
+
+          const observedCounter =
+            Number(
+              cardCounter
+            );
+
+
+          const observedIsBefore =
+            observedCardId ===
+              Number(
+                checkout.card_id
+              ) &&
+            observedBalance ===
+              balanceBefore &&
+            observedCounter ===
+              counterBefore;
+
+
+          const observedIsAfter =
+            observedCardId ===
+              Number(
+                checkout.card_id
+              ) &&
+            observedBalance ===
+              balanceAfter &&
+            observedCounter ===
+              counterAfter;
+
+
+          const serverIsBefore =
+            serverBalance ===
+              balanceBefore &&
+            serverCounter ===
+              counterBefore;
+
+
+          const serverIsAfter =
+            serverBalance ===
+              balanceAfter &&
+            serverCounter ===
+              counterAfter;
+
+
+          /*
+           * Si una reconciliación genérica anterior ya confirmó la
+           * transacción y cards, cerramos también el checkout.
+           */
+
+          if (
+            transaction.card_write_status ===
+              "CONFIRMED" &&
+            serverIsAfter &&
+            observedIsAfter
+          ) {
+
+            const confirmedCheckoutResult =
+              await client.query(
+                `
+                  update recharge_checkouts
+                  set
+                      status = 'CONFIRMED',
+                      confirmed_at =
+                        coalesce(
+                          confirmed_at,
+                          now()
+                        ),
+                      failed_at = null,
+                      failure_reason = null,
+                      updated_at = now()
+                  where id = $1
+                  returning *
+                `,
+                [
+                  checkout.id,
+                ]
+              );
+
+
+            await client.query(
+              "COMMIT"
+            );
+
+
+            return {
+              reconciled:
+                true,
+
+              action:
+                "CONFIRMED_CHECKOUT_FROM_CONFIRMED_TRANSACTION",
+
+              transactionId:
+                transaction.id,
+
+              cardId:
+                Number(
+                  checkout.card_id
+                ),
+
+              balance:
+                balanceAfter,
+
+              transactionCounter:
+                counterAfter,
+
+              checkout:
+                mapCheckoutRow(
+                  confirmedCheckoutResult
+                    .rows[0]
+                ),
+            };
+          }
+
+
+          /*
+           * Si una reconciliación anterior ya declaró FAILED y tanto
+           * PostgreSQL como NFC siguen en BEFORE, liberamos checkout.
+           */
+
+          if (
+            transaction.card_write_status ===
+              "FAILED" &&
+            serverIsBefore &&
+            observedIsBefore
+          ) {
+
+            const failedCheckoutResult =
+              await client.query(
+                `
+                  update recharge_checkouts
+                  set
+                      status = 'FAILED',
+                      failed_at =
+                        coalesce(
+                          failed_at,
+                          now()
+                        ),
+                      failure_reason =
+                        coalesce(
+                          failure_reason,
+                          'Reconciliación checkout: transacción ya estaba FAILED y la NFC permaneció BEFORE.'
+                        ),
+                      updated_at = now()
+                  where id = $1
+                  returning *
+                `,
+                [
+                  checkout.id,
+                ]
+              );
+
+
+            await client.query(
+              "COMMIT"
+            );
+
+
+            return {
+              reconciled:
+                true,
+
+              action:
+                "FAILED_CHECKOUT_FROM_FAILED_TRANSACTION",
+
+              transactionId:
+                transaction.id,
+
+              cardId:
+                Number(
+                  checkout.card_id
+                ),
+
+              balance:
+                balanceBefore,
+
+              transactionCounter:
+                counterBefore,
+
+              checkout:
+                mapCheckoutRow(
+                  failedCheckoutResult
+                    .rows[0]
+                ),
+            };
+          }
+
+
+          if (
+            transaction.card_write_status ===
+              "REVERSAL_REQUIRED" ||
+            existingCard.financial_hold ===
+              true
+          ) {
+
+            const manualCheckoutResult =
+              await client.query(
+                `
+                  update recharge_checkouts
+                  set
+                      status =
+                        'MANUAL_REVIEW_REQUIRED',
+                      failure_reason =
+                        coalesce(
+                          failure_reason,
+                          'Reconciliación checkout: tarjeta o transacción ya requiere revisión manual.'
+                        ),
+                      updated_at =
+                        now()
+                  where id = $1
+                  returning *
+                `,
+                [
+                  checkout.id,
+                ]
+              );
+
+
+            await client.query(
+              "COMMIT"
+            );
+
+
+            return reply
+              .status(409)
+              .send({
+                error:
+                  "MANUAL_REVIEW_REQUIRED",
+
+                transactionId:
+                  transaction.id,
+
+                financialHold:
+                  Boolean(
+                    existingCard.financial_hold
+                  ),
+
+                checkout:
+                  mapCheckoutRow(
+                    manualCheckoutResult
+                      .rows[0]
+                  ),
+              });
+          }
+
+
+          /*
+           * Flujo normal pendiente.
+           */
+
+          if (
+            transaction.card_write_status ===
+              "AUTHORIZED" &&
+            serverIsBefore &&
+            observedIsAfter
+          ) {
+
+            await client.query(
+              "COMMIT"
+            );
+
+
+            return {
+              reconciled:
+                false,
+
+              action:
+                "CONFIRM_REQUIRED",
+
+              cardPath:
+                "EXISTING",
+
+              transactionId:
+                transaction.id,
+
+              checkoutId:
+                checkout.id,
+
+              expectedAfter: {
+                cardId:
+                  Number(
+                    checkout.card_id
+                  ),
+
+                balance:
+                  balanceAfter,
+
+                transactionCounter:
+                  counterAfter,
+              },
+
+              checkout:
+                mapCheckoutRow(
+                  checkout
+                ),
+            };
+          }
+
+
+          if (
+            transaction.card_write_status ===
+              "AUTHORIZED" &&
+            serverIsBefore &&
+            observedIsBefore
+          ) {
+
+            await client.query(
+              `
+                update transactions
+                set
+                    card_write_status =
+                      'FAILED',
+                    failed_at =
+                      coalesce(
+                        failed_at,
+                        now()
+                      ),
+                    failure_reason =
+                      'Reconciliación checkout: la NFC permaneció en BEFORE.'
+                where id = $1
+              `,
+              [
+                transaction.id,
+              ]
+            );
+
+
+            const failedCheckoutResult =
+              await client.query(
+                `
+                  update recharge_checkouts
+                  set
+                      status =
+                        'FAILED',
+                      failed_at =
+                        coalesce(
+                          failed_at,
+                          now()
+                        ),
+                      failure_reason =
+                        'Reconciliación checkout: la NFC permaneció en BEFORE.',
+                      updated_at =
+                        now()
+                  where id = $1
+                  returning *
+                `,
+                [
+                  checkout.id,
+                ]
+              );
+
+
+            await client.query(
+              "COMMIT"
+            );
+
+
+            return {
+              reconciled:
+                true,
+
+              action:
+                "FAILED_EXISTING_CHECKOUT_BEFORE_WRITE",
+
+              transactionId:
+                transaction.id,
+
+              cardId:
+                Number(
+                  checkout.card_id
+                ),
+
+              balance:
+                balanceBefore,
+
+              transactionCounter:
+                counterBefore,
+
+              checkout:
+                mapCheckoutRow(
+                  failedCheckoutResult
+                    .rows[0]
+                ),
+            };
+          }
+
+
+          /*
+           * Estado inesperado.
+           *
+           * Igual que /transactions/reconcile:
+           * - fotografía forense;
+           * - transaction -> REVERSAL_REQUIRED;
+           * - card -> financial_hold;
+           * - checkout -> MANUAL_REVIEW_REQUIRED.
+           */
+
+          const ledgerResult =
+            await client.query(
+              `
+                select
+                    coalesce(
+                      sum(
+                        cfl.remaining_amount
+                      ),
+                      0
+                    ) as ledger_balance
+
+                from card_fund_lots cfl
+
+                where cfl.card_id = $1
+                  and cfl.activation_id = $2
+              `,
+              [
+                checkout.card_id,
+                existingCard.current_activation_id,
+              ]
+            );
+
+
+          const ledgerBalance =
+            Number(
+              ledgerResult
+                .rows[0]
+                .ledger_balance
+            );
+
+
+          await client.query(
+            `
+              insert into card_financial_incidents (
+                  card_id,
+                  activation_id,
+                  transaction_id,
+                  incident_type,
+                  device_code,
+                  nfc_balance,
+                  nfc_counter,
+                  server_balance,
+                  server_counter,
+                  ledger_balance,
+                  expected_before_balance,
+                  expected_before_counter,
+                  expected_after_balance,
+                  expected_after_counter,
+                  transaction_type,
+                  transaction_amount,
+                  promotion_id,
+                  transaction_status_before,
+                  failure_reason
+              )
+
+              values (
+                  $1,
+                  $2,
+                  $3,
+                  'MANUAL_REVIEW_REQUIRED',
+                  $4,
+                  $5,
+                  $6,
+                  $7,
+                  $8,
+                  $9,
+                  $10,
+                  $11,
+                  $12,
+                  $13,
+                  $14,
+                  $15,
+                  $16,
+                  $17,
+                  'Reconciliación checkout: estado físico inesperado.'
+              )
+
+              on conflict (transaction_id)
+              do nothing
+            `,
+            [
+              checkout.card_id,
+              existingCard.current_activation_id,
+              transaction.id,
+              normalizedDeviceCode,
+              observedBalance,
+              observedCounter,
+              serverBalance,
+              serverCounter,
+              ledgerBalance,
+              balanceBefore,
+              counterBefore,
+              balanceAfter,
+              counterAfter,
+              transaction.transaction_type,
+              Number(
+                transaction.amount
+              ),
+              transaction.promotion_id,
+              transaction.card_write_status,
+            ]
+          );
+
+
+          await client.query(
+            `
+              update transactions
+              set
+                  card_write_status =
+                    'REVERSAL_REQUIRED',
+                  failure_reason =
+                    'Reconciliación checkout: estado físico inesperado.'
+              where id = $1
+            `,
+            [
+              transaction.id,
+            ]
+          );
+
+
+          await client.query(
+            `
+              update cards
+              set
+                  financial_hold = true,
+                  financial_hold_reason =
+                    'MANUAL_REVIEW_REQUIRED',
+                  financial_hold_at =
+                    coalesce(
+                      financial_hold_at,
+                      now()
+                    ),
+                  updated_at = now()
+              where card_id = $1
+            `,
+            [
+              checkout.card_id,
+            ]
+          );
+
+
+          const manualCheckoutResult =
+            await client.query(
+              `
+                update recharge_checkouts
+                set
+                    status =
+                      'MANUAL_REVIEW_REQUIRED',
+                    failure_reason =
+                      'Reconciliación checkout: estado físico inesperado.',
+                    updated_at =
+                      now()
+                where id = $1
+                returning *
+              `,
+              [
+                checkout.id,
+              ]
+            );
+
+
+          await client.query(
+            "COMMIT"
+          );
+
+
+          return reply
+            .status(409)
+            .send({
+              error:
+                "MANUAL_REVIEW_REQUIRED",
+
+              transactionId:
+                transaction.id,
+
+              financialHold:
+                true,
+
+              serverState: {
+                balance:
+                  serverBalance,
+
+                transactionCounter:
+                  serverCounter,
+              },
+
+              ledgerState: {
+                balance:
+                  ledgerBalance,
+              },
+
+              expectedBefore: {
+                balance:
+                  balanceBefore,
+
+                transactionCounter:
+                  counterBefore,
+              },
+
+              expectedAfter: {
+                balance:
+                  balanceAfter,
+
+                transactionCounter:
+                  counterAfter,
+              },
+
+              cardState: {
+                cardId:
+                  observedCardId,
+
+                balance:
+                  observedBalance,
+
+                transactionCounter:
+                  observedCounter,
+              },
+
+              checkout:
+                mapCheckoutRow(
+                  manualCheckoutResult
+                    .rows[0]
+                ),
+            });
+        }
+
+
+        await client.query(
+          "ROLLBACK"
+        );
+
+
+        return reply
+          .status(409)
+          .send({
+            error:
+              "RECONCILE_CARD_PATH_NOT_SUPPORTED",
+
+            cardPath:
+              checkout.card_path,
+          });
+
+
+      } catch (
+        error: any
+      ) {
+
+        try {
+
+          await client.query(
+            "ROLLBACK"
+          );
+
+        } catch {
+        }
+
+
+        if (
+          error?.code ===
+          "22P02"
+        ) {
+
+          return reply
+            .status(400)
+            .send({
+              error:
+                "INVALID_CHECKOUT_ID",
+            });
+        }
+
 
         server.log.error(
           error
@@ -4386,7 +7152,9 @@ export async function rechargeCheckoutRoutes(
 
           if (
             checkout.card_path ===
-            "NEW"
+              "NEW" ||
+            checkout.card_path ===
+              "REUSED"
           ) {
 
             expectedConfirmedBalance =
@@ -4591,7 +7359,9 @@ export async function rechargeCheckoutRoutes(
           checkout.card_path !==
             "NEW" &&
           checkout.card_path !==
-            "EXISTING"
+            "EXISTING" &&
+          checkout.card_path !==
+            "REUSED"
         ) {
 
           await client.query(
@@ -4612,8 +7382,12 @@ export async function rechargeCheckoutRoutes(
 
 
         if (
-          checkout.card_path ===
-            "NEW" &&
+          (
+            checkout.card_path ===
+              "NEW" ||
+            checkout.card_path ===
+              "REUSED"
+          ) &&
           checkout.registration_id ===
             null
         ) {
@@ -5352,28 +8126,79 @@ export async function rechargeCheckoutRoutes(
 
         /*
          * -------------------------------------------------
-         * EL UID / card_id TODAVÍA NO DEBEN EXISTIR
+         * MATERIALIZAR / REACTIVAR CUSTOMER BASE 0/0
          * -------------------------------------------------
+         *
+         * NEW crea cards por primera vez.
+         * REUSED conserva el mismo card_id y exige que PostgreSQL
+         * siga exactamente en el estado devuelto seguro antes de
+         * iniciar una nueva activación.
          */
 
-        const existingCardResult =
+        if (
+          checkout.card_path ===
+          "NEW"
+        ) {
+
+          const existingCardResult =
+            await client.query(
+              `
+                select card_id
+                from cards
+                where card_id = $1
+                   or upper(uid) = upper($2)
+                for update
+              `,
+              [
+                reservedCardId,
+                normalizedTargetUid,
+              ]
+            );
+
+          if (
+            existingCardResult.rowCount &&
+            existingCardResult.rowCount >
+              0
+          ) {
+
+            await client.query(
+              "ROLLBACK"
+            );
+
+            return reply
+              .status(409)
+              .send({
+                error:
+                  "NEW_CARD_ALREADY_EXISTS",
+              });
+          }
+
           await client.query(
             `
-              select
+              insert into cards (
                   card_id,
                   uid,
                   card_type,
                   status,
                   balance,
-                  transaction_counter
-
-              from cards
-
-              where card_id = $1
-                 or upper(uid) =
-                    upper($2)
-
-              for update
+                  transaction_counter,
+                  current_activation_id,
+                  financial_hold,
+                  financial_hold_reason,
+                  financial_hold_at
+              )
+              values (
+                  $1,
+                  $2,
+                  'CUSTOMER',
+                  'ACTIVE',
+                  0,
+                  0,
+                  null,
+                  false,
+                  null,
+                  null
+              )
             `,
             [
               reservedCardId,
@@ -5381,74 +8206,128 @@ export async function rechargeCheckoutRoutes(
             ]
           );
 
+        } else {
 
-        if (
-          existingCardResult.rowCount &&
-          existingCardResult.rowCount >
-          0
-        ) {
+          const reusableCardResult =
+            await client.query(
+              `
+                select
+                    c.card_id,
+                    c.uid,
+                    c.card_type,
+                    c.status,
+                    c.balance,
+                    c.transaction_counter,
+                    c.current_activation_id,
+                    c.financial_hold,
+                    c.financial_hold_reason,
+                    c.financial_hold_at,
+                    last_activation.id as last_activation_id,
+                    last_activation.status as last_activation_status,
+                    (r.id is not null) as has_return_audit
+                from cards c
+                left join lateral (
+                  select id, status, activation_number
+                  from customer_card_activations
+                  where card_id = c.card_id
+                  order by activation_number desc
+                  limit 1
+                ) last_activation on true
+                left join customer_card_returns r
+                  on r.activation_id = last_activation.id
+                where c.card_id = $1
+                for update of c
+              `,
+              [
+                reservedCardId,
+              ]
+            );
+
+          if (
+            reusableCardResult.rowCount ===
+            0
+          ) {
+
+            await client.query(
+              "ROLLBACK"
+            );
+
+            return reply
+              .status(404)
+              .send({
+                error:
+                  "CARD_NOT_FOUND",
+              });
+          }
+
+          const reusableCard =
+            reusableCardResult.rows[0];
+
+          const reusable =
+            normalizeUid(
+              reusableCard.uid
+            ) ===
+              normalizedTargetUid &&
+            reusableCard.card_type ===
+              "CUSTOMER" &&
+            reusableCard.status ===
+              "INACTIVE" &&
+            Number(
+              reusableCard.balance
+            ) ===
+              0 &&
+            Number(
+              reusableCard.transaction_counter
+            ) ===
+              0 &&
+            reusableCard.current_activation_id ===
+              null &&
+            reusableCard.last_activation_id !==
+              null &&
+            reusableCard.last_activation_status ===
+              "RETURNED" &&
+            Boolean(
+              reusableCard.has_return_audit
+            ) &&
+            reusableCard.financial_hold !==
+              true;
+
+          if (
+            !reusable
+          ) {
+
+            await client.query(
+              "ROLLBACK"
+            );
+
+            return reply
+              .status(409)
+              .send({
+                error:
+                  "CARD_NOT_REUSABLE",
+              });
+          }
 
           await client.query(
-            "ROLLBACK"
+            `
+              update cards
+              set
+                  status = 'ACTIVE',
+                  balance = 0,
+                  transaction_counter = 0,
+                  updated_at = now()
+              where card_id = $1
+            `,
+            [
+              reservedCardId,
+            ]
           );
-
-
-          return reply
-            .status(409)
-            .send({
-              error:
-                "NEW_CARD_ALREADY_EXISTS",
-            });
         }
 
 
         /*
          * -------------------------------------------------
-         * CREAR CUSTOMER BASE 0/0
-         * -------------------------------------------------
-         *
-         * current_activation_id se asigna después de crear
-         * la activación para respetar la FK circular.
-         */
-
-        await client.query(
-          `
-            insert into cards (
-                card_id,
-                uid,
-                card_type,
-                status,
-                balance,
-                transaction_counter,
-                current_activation_id,
-                financial_hold,
-                financial_hold_reason,
-                financial_hold_at
-            )
-
-            values (
-                $1,
-                $2,
-                'CUSTOMER',
-                'ACTIVE',
-                0,
-                0,
-                null,
-                false,
-                null,
-                null
-            )
-          `,
-          [
-            reservedCardId,
-            normalizedTargetUid,
-          ]
-        );
-
-
-        /*
-         * -------------------------------------------------
-         * ACTIVACIÓN #1
+         * NUEVA ACTIVACIÓN
          * -------------------------------------------------
          */
 
@@ -5457,6 +8336,41 @@ export async function rechargeCheckoutRoutes(
             checkout
               .activation_fee_amount
           );
+
+
+        const activationNumberResult =
+          await client.query(
+            `
+              select
+                  coalesce(
+                    max(activation_number),
+                    0
+                  ) + 1 as next_activation_number
+              from customer_card_activations
+              where card_id = $1
+            `,
+            [
+              reservedCardId,
+            ]
+          );
+
+        const activationNumber =
+          Number(
+            activationNumberResult.rows[0].next_activation_number
+          );
+
+        if (
+          !Number.isSafeInteger(
+            activationNumber
+          ) ||
+          activationNumber <=
+            0
+        ) {
+
+          throw new Error(
+            "INVALID_NEXT_ACTIVATION_NUMBER"
+          );
+        }
 
 
         const activationResult =
@@ -5476,13 +8390,13 @@ export async function rechargeCheckoutRoutes(
 
               values (
                   $1,
-                  1,
                   $2,
                   $3,
-                  'ACTIVE',
                   $4,
+                  'ACTIVE',
                   $5,
                   $6,
+                  $7,
                   now()
               )
 
@@ -5490,6 +8404,7 @@ export async function rechargeCheckoutRoutes(
             `,
             [
               reservedCardId,
+              activationNumber,
               activationFee,
               checkout.actor_role ===
                 "RECHARGE",

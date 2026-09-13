@@ -67,7 +67,14 @@ export async function webAdminReportRoutes(server: FastifyInstance) {
 
   /*
    * =====================================================
-   * RESUMEN FINANCIERO WEB — FINANCIAL LEDGER V2
+   * RESUMEN FINANCIERO WEB — CHECKOUT + LEGACY
+   * =====================================================
+   *
+   * Regla:
+   * - checkout CONFIRMED = fuente de verdad para pagos físicos nuevos;
+   * - transacciones antiguas sin checkout se conservan como LEGACY;
+   * - nunca se cuentan PENDING / IN_PROGRESS / FAILED /
+   *   MANUAL_REVIEW_REQUIRED como ingreso.
    * =====================================================
    */
   server.get<{ Querystring: WebReportQuery }>(
@@ -97,7 +104,19 @@ export async function webAdminReportRoutes(server: FastifyInstance) {
               )::date between $1::date and $2::date
           ),
 
-          recharge_financials as (
+          confirmed_checkouts as (
+            select rc.*
+            from recharge_checkouts rc
+            where rc.status = 'CONFIRMED'
+              and rc.actor_role = 'RECHARGE'
+              and rc.recharge_point_id is not null
+              and rc.confirmed_at is not null
+              and (
+                rc.confirmed_at at time zone $3
+              )::date between $1::date and $2::date
+          ),
+
+          legacy_recharge_financials as (
             select
               t.id,
               t.amount as credited_amount,
@@ -113,7 +132,7 @@ export async function webAdminReportRoutes(server: FastifyInstance) {
                     and c.fund_type = 'CASH'
                 ), 0)
                 else t.amount
-              end as cash_received,
+              end as paid_recharge_amount,
               case
                 when exists (
                   select 1
@@ -130,6 +149,23 @@ export async function webAdminReportRoutes(server: FastifyInstance) {
             from confirmed_transactions t
             where t.transaction_type = 'RECHARGE'
               and t.recharge_point_id is not null
+              and not exists (
+                select 1
+                from recharge_checkouts rc
+                where rc.recharge_transaction_id = t.id
+              )
+          ),
+
+          legacy_activation_financials as (
+            select t.id, t.amount
+            from confirmed_transactions t
+            where t.transaction_type = 'CARD_CREATED'
+              and t.recharge_point_id is not null
+              and not exists (
+                select 1
+                from recharge_checkouts rc
+                where rc.activation_transaction_id = t.id
+              )
           ),
 
           game_allocations as (
@@ -180,16 +216,62 @@ export async function webAdminReportRoutes(server: FastifyInstance) {
           )
 
           select
-            coalesce((select sum(r.cash_received) from recharge_financials r), 0) as recharge_cash_received,
-            coalesce((select sum(r.promotional_given) from recharge_financials r), 0) as recharge_promotional_given,
-            coalesce((select sum(r.credited_amount) from recharge_financials r), 0) as recharge_credited_amount,
+            coalesce((
+              select sum(rc.total_due_amount)
+              from confirmed_checkouts rc
+              where rc.payment_method = 'CASH'
+            ), 0) as checkout_cash_received,
 
             coalesce((
-              select sum(t.amount)
-              from confirmed_transactions t
-              where t.transaction_type = 'CARD_CREATED'
-                and t.recharge_point_id is not null
-            ), 0) as recharge_activation_amount,
+              select sum(rc.total_due_amount)
+              from confirmed_checkouts rc
+              where rc.payment_method = 'CARD'
+            ), 0) as checkout_card_received,
+
+            coalesce((
+              select sum(rc.paid_recharge_amount)
+              from confirmed_checkouts rc
+            ), 0) as checkout_paid_recharge_amount,
+
+            coalesce((
+              select sum(rc.promotional_credit_amount)
+              from confirmed_checkouts rc
+            ), 0) as checkout_promotional_given,
+
+            coalesce((
+              select sum(rc.credited_amount)
+              from confirmed_checkouts rc
+            ), 0) as checkout_credited_amount,
+
+            coalesce((
+              select sum(rc.activation_fee_amount)
+              from confirmed_checkouts rc
+            ), 0) as checkout_activation_amount,
+
+            coalesce((
+              select sum(rc.total_due_amount)
+              from confirmed_checkouts rc
+            ), 0) as checkout_total_income_amount,
+
+            coalesce((
+              select sum(lr.paid_recharge_amount)
+              from legacy_recharge_financials lr
+            ), 0) as legacy_paid_recharge_amount,
+
+            coalesce((
+              select sum(lr.promotional_given)
+              from legacy_recharge_financials lr
+            ), 0) as legacy_promotional_given,
+
+            coalesce((
+              select sum(lr.credited_amount)
+              from legacy_recharge_financials lr
+            ), 0) as legacy_credited_amount,
+
+            coalesce((
+              select sum(la.amount)
+              from legacy_activation_financials la
+            ), 0) as legacy_activation_amount,
 
             coalesce((
               select sum(t.amount)
@@ -285,10 +367,33 @@ export async function webAdminReportRoutes(server: FastifyInstance) {
         );
 
         const row = result.rows[0];
-        const cashReceived = Number(row.recharge_cash_received);
-        const promotionalGiven = Number(row.recharge_promotional_given);
-        const creditedAmount = Number(row.recharge_credited_amount);
-        const activationAmount = Number(row.recharge_activation_amount);
+
+        const checkoutCashReceived = Number(row.checkout_cash_received);
+        const checkoutCardReceived = Number(row.checkout_card_received);
+        const checkoutPaidRechargeAmount = Number(row.checkout_paid_recharge_amount);
+        const checkoutPromotionalGiven = Number(row.checkout_promotional_given);
+        const checkoutCreditedAmount = Number(row.checkout_credited_amount);
+        const checkoutActivationAmount = Number(row.checkout_activation_amount);
+        const checkoutTotalIncomeAmount = Number(row.checkout_total_income_amount);
+
+        const legacyPaidRechargeAmount = Number(row.legacy_paid_recharge_amount);
+        const legacyPromotionalGiven = Number(row.legacy_promotional_given);
+        const legacyCreditedAmount = Number(row.legacy_credited_amount);
+        const legacyActivationAmount = Number(row.legacy_activation_amount);
+        const legacyUnclassifiedReceived =
+          legacyPaidRechargeAmount + legacyActivationAmount;
+
+        const paidRechargeAmount =
+          checkoutPaidRechargeAmount + legacyPaidRechargeAmount;
+        const promotionalGiven =
+          checkoutPromotionalGiven + legacyPromotionalGiven;
+        const creditedAmount =
+          checkoutCreditedAmount + legacyCreditedAmount;
+        const activationAmount =
+          checkoutActivationAmount + legacyActivationAmount;
+        const totalIncomeAmount =
+          checkoutTotalIncomeAmount + legacyUnclassifiedReceived;
+
         const gameConsumptionAmount = Number(row.game_consumption_amount);
         const gameCashConsumed = Number(row.game_cash_consumed);
         const gamePromotionalConsumed = Number(row.game_promotional_consumed);
@@ -320,19 +425,26 @@ export async function webAdminReportRoutes(server: FastifyInstance) {
           to,
           timezone: REPORT_TIMEZONE,
           summary: {
-            /* Compatibilidad con el dashboard WEB actual. */
-            rechargePointAmount: cashReceived + activationAmount,
-            rechargePointRechargeAmount: cashReceived,
+            /*
+             * Compatibilidad con el dashboard WEB actual.
+             * rechargePointRechargeAmount ahora significa
+             * "recargas pagadas", no "efectivo físico".
+             */
+            rechargePointAmount: totalIncomeAmount,
+            rechargePointRechargeAmount: paidRechargeAmount,
             rechargePointActivationAmount: activationAmount,
             gameConsumptionAmount,
             gamePeopleCount: Number(row.game_people_count),
 
             rechargePoints: {
-              cashReceived,
+              cashReceived: checkoutCashReceived,
+              cardReceived: checkoutCardReceived,
+              legacyUnclassifiedReceived,
+              paidRechargeAmount,
               promotionalGiven,
               creditedAmount,
               activationAmount,
-              totalIncomeAmount: cashReceived + activationAmount,
+              totalIncomeAmount,
             },
 
             games: {
@@ -741,6 +853,15 @@ export async function webAdminReportRoutes(server: FastifyInstance) {
    * =====================================================
    * TAQUILLAS — LISTADO / COMPARATIVA DIARIA
    * =====================================================
+   *
+   * Nuevo criterio financiero:
+   * - checkout CONFIRMED manda para operaciones nuevas;
+   * - CASH / CARD salen de payment_method;
+   * - operaciones legacy sin checkout se conservan como
+   *   ingreso no clasificado por método de pago;
+   * - FAILED / PENDING / IN_PROGRESS / MANUAL_REVIEW_REQUIRED
+   *   nunca se contabilizan como ingreso.
+   * =====================================================
    */
   server.get<{ Querystring: WebReportQuery }>(
     "/web/admin/reports/recharge-points",
@@ -759,15 +880,35 @@ export async function webAdminReportRoutes(server: FastifyInstance) {
       try {
         const result = await client.query(
           `
-          with recharge_financials as (
+          with confirmed_checkouts as (
+            select
+              rc.recharge_point_id,
+              (rc.confirmed_at at time zone $3)::date as report_date,
+              rc.payment_method,
+              rc.paid_recharge_amount,
+              rc.promotional_credit_amount,
+              rc.credited_amount,
+              rc.activation_fee_amount,
+              rc.total_due_amount
+            from recharge_checkouts rc
+            where rc.status = 'CONFIRMED'
+              and rc.actor_role = 'RECHARGE'
+              and rc.recharge_point_id is not null
+              and rc.confirmed_at is not null
+              and (
+                rc.confirmed_at at time zone $3
+              )::date between $1::date and $2::date
+          ),
+
+          legacy_recharge_financials as (
             select
               t.id,
               t.recharge_point_id,
-              t.amount,
               (
                 coalesce(t.confirmed_at, t.created_at)
                 at time zone $3
               )::date as report_date,
+              t.amount as credited_amount,
               case
                 when exists (
                   select 1
@@ -780,7 +921,7 @@ export async function webAdminReportRoutes(server: FastifyInstance) {
                     and c.fund_type = 'CASH'
                 ), 0)
                 else t.amount
-              end as cash_received,
+              end as paid_recharge_amount,
               case
                 when exists (
                   select 1
@@ -802,16 +943,21 @@ export async function webAdminReportRoutes(server: FastifyInstance) {
                 coalesce(t.confirmed_at, t.created_at)
                 at time zone $3
               )::date between $1::date and $2::date
+              and not exists (
+                select 1
+                from recharge_checkouts rc
+                where rc.recharge_transaction_id = t.id
+              )
           ),
 
-          activation_financials as (
+          legacy_activation_financials as (
             select
               t.recharge_point_id,
-              t.amount,
               (
                 coalesce(t.confirmed_at, t.created_at)
                 at time zone $3
-              )::date as report_date
+              )::date as report_date,
+              t.amount
             from transactions t
             where t.card_write_status = 'CONFIRMED'
               and t.transaction_type = 'CARD_CREATED'
@@ -820,22 +966,25 @@ export async function webAdminReportRoutes(server: FastifyInstance) {
                 coalesce(t.confirmed_at, t.created_at)
                 at time zone $3
               )::date between $1::date and $2::date
+              and not exists (
+                select 1
+                from recharge_checkouts rc
+                where rc.activation_transaction_id = t.id
+              )
           ),
 
           activation_counts as (
             select
               a.recharge_point_id,
               (
-                a.started_at
-                at time zone $3
+                a.started_at at time zone $3
               )::date as report_date,
               count(*)::bigint as activations_count
             from customer_card_activations a
             where a.activated_by_role = 'RECHARGE'
               and a.recharge_point_id is not null
               and (
-                a.started_at
-                at time zone $3
+                a.started_at at time zone $3
               )::date between $1::date and $2::date
             group by a.recharge_point_id, report_date
           ),
@@ -844,8 +993,7 @@ export async function webAdminReportRoutes(server: FastifyInstance) {
             select
               r.recharge_point_id,
               (
-                r.returned_at
-                at time zone $3
+                r.returned_at at time zone $3
               )::date as report_date,
               r.refund_amount,
               r.discarded_cash,
@@ -858,19 +1006,32 @@ export async function webAdminReportRoutes(server: FastifyInstance) {
               on a.id = r.activation_id
             where r.recharge_point_id is not null
               and (
-                r.returned_at
-                at time zone $3
+                r.returned_at at time zone $3
               )::date between $1::date and $2::date
           ),
 
           daily as (
             select
-              rf.recharge_point_id,
-              rf.report_date,
-              sum(rf.cash_received) as cash_received,
-              sum(rf.promotional_given) as promotional_given,
-              sum(rf.amount) as credited_amount,
-              0::bigint as activation_amount,
+              cc.recharge_point_id,
+              cc.report_date,
+              coalesce(sum(cc.total_due_amount) filter (
+                where cc.payment_method = 'CASH'
+              ), 0)::bigint as cash_received,
+              coalesce(sum(cc.total_due_amount) filter (
+                where cc.payment_method = 'CARD'
+              ), 0)::bigint as card_received,
+              coalesce(sum(cc.paid_recharge_amount) filter (
+                where cc.payment_method = 'CASH'
+              ), 0)::bigint as cash_recharge_amount,
+              coalesce(sum(cc.paid_recharge_amount) filter (
+                where cc.payment_method = 'CARD'
+              ), 0)::bigint as card_recharge_amount,
+              0::bigint as legacy_unclassified_received,
+              coalesce(sum(cc.paid_recharge_amount), 0)::bigint as paid_recharge_amount,
+              coalesce(sum(cc.promotional_credit_amount), 0)::bigint as promotional_given,
+              coalesce(sum(cc.credited_amount), 0)::bigint as credited_amount,
+              coalesce(sum(cc.activation_fee_amount), 0)::bigint as activation_amount,
+              coalesce(sum(cc.total_due_amount), 0)::bigint as total_income_amount,
               0::bigint as refund_amount,
               0::bigint as discarded_cash,
               0::bigint as discarded_promotional,
@@ -880,18 +1041,29 @@ export async function webAdminReportRoutes(server: FastifyInstance) {
               0::bigint as returns_count,
               0::bigint as recharge_origin_returns_count,
               0::bigint as admin_origin_returns_count
-            from recharge_financials rf
-            group by rf.recharge_point_id, rf.report_date
+            from confirmed_checkouts cc
+            group by cc.recharge_point_id, cc.report_date
 
             union all
 
             select
-              af.recharge_point_id,
-              af.report_date,
+              lr.recharge_point_id,
+              lr.report_date,
               0::bigint as cash_received,
-              0::bigint as promotional_given,
-              0::bigint as credited_amount,
-              sum(af.amount) as activation_amount,
+              0::bigint as card_received,
+              0::bigint as cash_recharge_amount,
+              0::bigint as card_recharge_amount,
+              coalesce(sum(lr.paid_recharge_amount), 0)::bigint
+                as legacy_unclassified_received,
+              coalesce(sum(lr.paid_recharge_amount), 0)::bigint
+                as paid_recharge_amount,
+              coalesce(sum(lr.promotional_given), 0)::bigint
+                as promotional_given,
+              coalesce(sum(lr.credited_amount), 0)::bigint
+                as credited_amount,
+              0::bigint as activation_amount,
+              coalesce(sum(lr.paid_recharge_amount), 0)::bigint
+                as total_income_amount,
               0::bigint as refund_amount,
               0::bigint as discarded_cash,
               0::bigint as discarded_promotional,
@@ -901,8 +1073,36 @@ export async function webAdminReportRoutes(server: FastifyInstance) {
               0::bigint as returns_count,
               0::bigint as recharge_origin_returns_count,
               0::bigint as admin_origin_returns_count
-            from activation_financials af
-            group by af.recharge_point_id, af.report_date
+            from legacy_recharge_financials lr
+            group by lr.recharge_point_id, lr.report_date
+
+            union all
+
+            select
+              la.recharge_point_id,
+              la.report_date,
+              0::bigint as cash_received,
+              0::bigint as card_received,
+              0::bigint as cash_recharge_amount,
+              0::bigint as card_recharge_amount,
+              coalesce(sum(la.amount), 0)::bigint
+                as legacy_unclassified_received,
+              0::bigint as paid_recharge_amount,
+              0::bigint as promotional_given,
+              0::bigint as credited_amount,
+              coalesce(sum(la.amount), 0)::bigint as activation_amount,
+              coalesce(sum(la.amount), 0)::bigint as total_income_amount,
+              0::bigint as refund_amount,
+              0::bigint as discarded_cash,
+              0::bigint as discarded_promotional,
+              0::bigint as discarded_admin_credit,
+              0::bigint as discarded_legacy,
+              0::bigint as activations_count,
+              0::bigint as returns_count,
+              0::bigint as recharge_origin_returns_count,
+              0::bigint as admin_origin_returns_count
+            from legacy_activation_financials la
+            group by la.recharge_point_id, la.report_date
 
             union all
 
@@ -910,9 +1110,15 @@ export async function webAdminReportRoutes(server: FastifyInstance) {
               ac.recharge_point_id,
               ac.report_date,
               0::bigint as cash_received,
+              0::bigint as card_received,
+              0::bigint as cash_recharge_amount,
+              0::bigint as card_recharge_amount,
+              0::bigint as legacy_unclassified_received,
+              0::bigint as paid_recharge_amount,
               0::bigint as promotional_given,
               0::bigint as credited_amount,
               0::bigint as activation_amount,
+              0::bigint as total_income_amount,
               0::bigint as refund_amount,
               0::bigint as discarded_cash,
               0::bigint as discarded_promotional,
@@ -930,14 +1136,23 @@ export async function webAdminReportRoutes(server: FastifyInstance) {
               rf.recharge_point_id,
               rf.report_date,
               0::bigint as cash_received,
+              0::bigint as card_received,
+              0::bigint as cash_recharge_amount,
+              0::bigint as card_recharge_amount,
+              0::bigint as legacy_unclassified_received,
+              0::bigint as paid_recharge_amount,
               0::bigint as promotional_given,
               0::bigint as credited_amount,
               0::bigint as activation_amount,
-              sum(rf.refund_amount) as refund_amount,
-              sum(rf.discarded_cash) as discarded_cash,
-              sum(rf.discarded_promotional) as discarded_promotional,
-              sum(rf.discarded_admin_credit) as discarded_admin_credit,
-              sum(rf.discarded_legacy) as discarded_legacy,
+              0::bigint as total_income_amount,
+              coalesce(sum(rf.refund_amount), 0)::bigint as refund_amount,
+              coalesce(sum(rf.discarded_cash), 0)::bigint as discarded_cash,
+              coalesce(sum(rf.discarded_promotional), 0)::bigint
+                as discarded_promotional,
+              coalesce(sum(rf.discarded_admin_credit), 0)::bigint
+                as discarded_admin_credit,
+              coalesce(sum(rf.discarded_legacy), 0)::bigint
+                as discarded_legacy,
               0::bigint as activations_count,
               count(*)::bigint as returns_count,
               count(*) filter (
@@ -955,9 +1170,17 @@ export async function webAdminReportRoutes(server: FastifyInstance) {
             rp.name,
             to_char(d.report_date, 'YYYY-MM-DD') as report_date,
             coalesce(sum(d.cash_received), 0) as cash_received,
+            coalesce(sum(d.card_received), 0) as card_received,
+            coalesce(sum(d.cash_recharge_amount), 0) as cash_recharge_amount,
+            coalesce(sum(d.card_recharge_amount), 0) as card_recharge_amount,
+            coalesce(sum(d.legacy_unclassified_received), 0)
+              as legacy_unclassified_received,
+            coalesce(sum(d.paid_recharge_amount), 0)
+              as paid_recharge_amount,
             coalesce(sum(d.promotional_given), 0) as promotional_given,
             coalesce(sum(d.credited_amount), 0) as credited_amount,
             coalesce(sum(d.activation_amount), 0) as activation_amount,
+            coalesce(sum(d.total_income_amount), 0) as total_income_amount,
             coalesce(sum(d.refund_amount), 0) as refund_amount,
             coalesce(sum(d.discarded_cash), 0) as discarded_cash,
             coalesce(sum(d.discarded_promotional), 0) as discarded_promotional,
@@ -988,7 +1211,13 @@ export async function webAdminReportRoutes(server: FastifyInstance) {
             point = {
               rechargePointId,
               name: row.name,
+
               cashReceived: 0,
+              cardReceived: 0,
+              cashRechargeAmount: 0,
+              cardRechargeAmount: 0,
+              legacyUnclassifiedReceived: 0,
+              paidRechargeAmount: 0,
               promotionalGiven: 0,
               creditedAmount: 0,
               activationAmount: 0,
@@ -1005,17 +1234,28 @@ export async function webAdminReportRoutes(server: FastifyInstance) {
               rechargeOriginReturnsCount: 0,
               adminOriginReturnsCount: 0,
 
-              /* Compatibilidad con la UI WEB anterior. */
+              /*
+               * Compatibilidad con UI anterior:
+               * rechargedAmount = recargas pagadas.
+               */
               rechargedAmount: 0,
               dailyBreakdown: [],
             };
+
             rechargePointsMap.set(rechargePointId, point);
           }
 
           const dailyCash = Number(row.cash_received);
+          const dailyCard = Number(row.card_received);
+          const dailyCashRecharge = Number(row.cash_recharge_amount);
+          const dailyCardRecharge = Number(row.card_recharge_amount);
+          const dailyLegacyUnclassified =
+            Number(row.legacy_unclassified_received);
+          const dailyPaidRecharge = Number(row.paid_recharge_amount);
           const dailyPromotional = Number(row.promotional_given);
           const dailyCredited = Number(row.credited_amount);
           const dailyActivation = Number(row.activation_amount);
+          const dailyIncome = Number(row.total_income_amount);
 
           const dailyRefund = Number(row.refund_amount);
           const dailyDiscardedCash = Number(row.discarded_cash);
@@ -1037,9 +1277,12 @@ export async function webAdminReportRoutes(server: FastifyInstance) {
           const dailyAdminOriginReturnsCount =
             Number(row.admin_origin_returns_count);
 
-          const dailyIncome = dailyCash + dailyActivation;
-
           point.cashReceived += dailyCash;
+          point.cardReceived += dailyCard;
+          point.cashRechargeAmount += dailyCashRecharge;
+          point.cardRechargeAmount += dailyCardRecharge;
+          point.legacyUnclassifiedReceived += dailyLegacyUnclassified;
+          point.paidRechargeAmount += dailyPaidRecharge;
           point.promotionalGiven += dailyPromotional;
           point.creditedAmount += dailyCredited;
           point.activationAmount += dailyActivation;
@@ -1056,11 +1299,17 @@ export async function webAdminReportRoutes(server: FastifyInstance) {
           point.rechargeOriginReturnsCount += dailyRechargeOriginReturnsCount;
           point.adminOriginReturnsCount += dailyAdminOriginReturnsCount;
 
-          point.rechargedAmount += dailyCash;
+          point.rechargedAmount += dailyPaidRecharge;
 
           point.dailyBreakdown.push({
             date: row.report_date,
+
             cashReceived: dailyCash,
+            cardReceived: dailyCard,
+            cashRechargeAmount: dailyCashRecharge,
+            cardRechargeAmount: dailyCardRecharge,
+            legacyUnclassifiedReceived: dailyLegacyUnclassified,
+            paidRechargeAmount: dailyPaidRecharge,
             promotionalGiven: dailyPromotional,
             creditedAmount: dailyCredited,
             activationAmount: dailyActivation,
@@ -1078,7 +1327,7 @@ export async function webAdminReportRoutes(server: FastifyInstance) {
             adminOriginReturnsCount: dailyAdminOriginReturnsCount,
 
             /* Compatibilidad con gráficas actuales. */
-            rechargedAmount: dailyCash,
+            rechargedAmount: dailyPaidRecharge,
           });
         }
 
@@ -1104,6 +1353,12 @@ export async function webAdminReportRoutes(server: FastifyInstance) {
   /*
    * =====================================================
    * TAQUILLA — DETALLE / AUDITORÍA WEB
+   * =====================================================
+   *
+   * La vista de detalle usa checkout CONFIRMED como fuente
+   * de verdad para ingreso físico moderno. Las transacciones
+   * legacy sin checkout siguen visibles y se reportan como
+   * ingreso no clasificado por método de pago.
    * =====================================================
    */
   server.get<{
@@ -1140,18 +1395,31 @@ export async function webAdminReportRoutes(server: FastifyInstance) {
 
         const pointRow = pointResult.rows[0];
 
+        /*
+         * -----------------------------------------------------
+         * Auditoría de recargas confirmadas.
+         * -----------------------------------------------------
+         *
+         * Se conserva una fila por RECHARGE para la UI de
+         * historial/auditoría, pero la clasificación CASH/CARD
+         * viene del checkout cuando existe.
+         */
         const transactionsResult = await client.query(
           `
           with credit_totals as (
             select
               c.transaction_id,
-              coalesce(sum(c.amount) filter (where c.fund_type = 'CASH'), 0) as cash_amount,
-              coalesce(sum(c.amount) filter (where c.fund_type = 'PROMOTIONAL'), 0) as promotional_amount,
-              coalesce(sum(c.amount) filter (where c.fund_type = 'ADMIN_CREDIT'), 0) as admin_credit_amount,
+              coalesce(sum(c.amount) filter (where c.fund_type = 'CASH'), 0)
+                as ledger_cash_amount,
+              coalesce(sum(c.amount) filter (where c.fund_type = 'PROMOTIONAL'), 0)
+                as promotional_amount,
+              coalesce(sum(c.amount) filter (where c.fund_type = 'ADMIN_CREDIT'), 0)
+                as admin_credit_amount,
               count(*) as component_count
             from transaction_credit_components c
             group by c.transaction_id
           )
+
           select
             t.id,
             t.card_id,
@@ -1169,20 +1437,66 @@ export async function webAdminReportRoutes(server: FastifyInstance) {
             p.total_credit_amount as promotion_total_credit_amount,
             t.created_at,
             t.confirmed_at,
+
+            rc.id as checkout_id,
+            rc.card_path,
+            rc.payment_method,
+            rc.status as checkout_status,
+            rc.paid_recharge_amount as checkout_paid_recharge_amount,
+            rc.promotional_credit_amount as checkout_promotional_amount,
+            rc.credited_amount as checkout_credited_amount,
+            rc.activation_fee_amount as checkout_activation_fee_amount,
+            rc.total_due_amount as checkout_total_due_amount,
+
             case
+              when rc.id is not null
+              then rc.paid_recharge_amount
               when coalesce(ct.component_count, 0) > 0
-              then coalesce(ct.cash_amount, 0)
+              then coalesce(ct.ledger_cash_amount, 0)
               else t.amount
-            end as cash_received,
+            end as paid_recharge_amount,
+
             case
+              when rc.id is not null
+              then rc.promotional_credit_amount
               when coalesce(ct.component_count, 0) > 0
               then coalesce(ct.promotional_amount, 0)
               else 0
             end as promotional_given,
+
+            case
+              when rc.id is not null and rc.payment_method = 'CASH'
+              then rc.total_due_amount
+              else 0
+            end as cash_received,
+
+            case
+              when rc.id is not null and rc.payment_method = 'CARD'
+              then rc.total_due_amount
+              else 0
+            end as card_received,
+
+            case
+              when rc.id is null
+              then
+                case
+                  when coalesce(ct.component_count, 0) > 0
+                  then coalesce(ct.ledger_cash_amount, 0)
+                  else t.amount
+                end
+              else 0
+            end as legacy_unclassified_received,
+
             coalesce(ct.admin_credit_amount, 0) as admin_credit_amount
+
           from transactions t
-          left join credit_totals ct on ct.transaction_id = t.id
-          left join promotions p on p.id = t.promotion_id
+          left join credit_totals ct
+            on ct.transaction_id = t.id
+          left join promotions p
+            on p.id = t.promotion_id
+          left join recharge_checkouts rc
+            on rc.recharge_transaction_id = t.id
+
           where t.recharge_point_id = $1
             and t.transaction_type = 'RECHARGE'
             and t.card_write_status = 'CONFIRMED'
@@ -1190,39 +1504,114 @@ export async function webAdminReportRoutes(server: FastifyInstance) {
             and (
               t.confirmed_at at time zone $4
             )::date between $2::date and $3::date
+
           order by t.confirmed_at desc
           `,
           [rechargePointId, from, to, REPORT_TIMEZONE]
         );
 
-        const activationResult = await client.query(
+        /*
+         * -----------------------------------------------------
+         * Resumen financiero diario de la taquilla.
+         * -----------------------------------------------------
+         */
+        const financialResult = await client.query(
           `
-          select
-            coalesce(sum(t.amount), 0) as activation_amount,
-            to_char(
-              (coalesce(t.confirmed_at, t.created_at) at time zone $4)::date,
-              'YYYY-MM-DD'
-            ) as report_date
-          from transactions t
-          where t.recharge_point_id = $1
-            and t.transaction_type = 'CARD_CREATED'
-            and t.card_write_status = 'CONFIRMED'
-            and (
-              coalesce(t.confirmed_at, t.created_at) at time zone $4
-            )::date between $2::date and $3::date
-          group by report_date
-          order by report_date asc
-          `,
-          [rechargePointId, from, to, REPORT_TIMEZONE]
-        );
-
-        const activationCountResult = await client.query(
-          `
+          with confirmed_checkouts as (
             select
-              to_char(
-                (a.started_at at time zone $4)::date,
-                'YYYY-MM-DD'
-              ) as report_date,
+              (rc.confirmed_at at time zone $4)::date as report_date,
+              rc.payment_method,
+              rc.paid_recharge_amount,
+              rc.promotional_credit_amount,
+              rc.credited_amount,
+              rc.activation_fee_amount,
+              rc.total_due_amount
+            from recharge_checkouts rc
+            where rc.recharge_point_id = $1
+              and rc.actor_role = 'RECHARGE'
+              and rc.status = 'CONFIRMED'
+              and rc.confirmed_at is not null
+              and (
+                rc.confirmed_at at time zone $4
+              )::date between $2::date and $3::date
+          ),
+
+          legacy_recharges as (
+            select
+              t.id,
+              (
+                coalesce(t.confirmed_at, t.created_at)
+                at time zone $4
+              )::date as report_date,
+              t.amount as credited_amount,
+              case
+                when exists (
+                  select 1
+                  from transaction_credit_components c0
+                  where c0.transaction_id = t.id
+                ) then coalesce((
+                  select sum(c.amount)
+                  from transaction_credit_components c
+                  where c.transaction_id = t.id
+                    and c.fund_type = 'CASH'
+                ), 0)
+                else t.amount
+              end as paid_recharge_amount,
+              case
+                when exists (
+                  select 1
+                  from transaction_credit_components c0
+                  where c0.transaction_id = t.id
+                ) then coalesce((
+                  select sum(c.amount)
+                  from transaction_credit_components c
+                  where c.transaction_id = t.id
+                    and c.fund_type = 'PROMOTIONAL'
+                ), 0)
+                else 0
+              end as promotional_given
+            from transactions t
+            where t.recharge_point_id = $1
+              and t.transaction_type = 'RECHARGE'
+              and t.card_write_status = 'CONFIRMED'
+              and (
+                coalesce(t.confirmed_at, t.created_at)
+                at time zone $4
+              )::date between $2::date and $3::date
+              and not exists (
+                select 1
+                from recharge_checkouts rc
+                where rc.recharge_transaction_id = t.id
+              )
+          ),
+
+          legacy_activations as (
+            select
+              (
+                coalesce(t.confirmed_at, t.created_at)
+                at time zone $4
+              )::date as report_date,
+              t.amount
+            from transactions t
+            where t.recharge_point_id = $1
+              and t.transaction_type = 'CARD_CREATED'
+              and t.card_write_status = 'CONFIRMED'
+              and (
+                coalesce(t.confirmed_at, t.created_at)
+                at time zone $4
+              )::date between $2::date and $3::date
+              and not exists (
+                select 1
+                from recharge_checkouts rc
+                where rc.activation_transaction_id = t.id
+              )
+          ),
+
+          activation_counts as (
+            select
+              (
+                a.started_at at time zone $4
+              )::date as report_date,
               count(*)::bigint as activations_count
             from customer_card_activations a
             where a.activated_by_role = 'RECHARGE'
@@ -1231,118 +1620,373 @@ export async function webAdminReportRoutes(server: FastifyInstance) {
                 a.started_at at time zone $4
               )::date between $2::date and $3::date
             group by report_date
-            order by report_date asc
-          `,
-          [rechargePointId, from, to, REPORT_TIMEZONE]
-        );
+          ),
 
-        const returnsResult = await client.query(
-          `
-          select
-            to_char(
+          returns as (
+            select
               (
-                r.returned_at
-                at time zone $4
-              )::date,
-              'YYYY-MM-DD'
-            ) as report_date,
+                r.returned_at at time zone $4
+              )::date as report_date,
+              r.refund_amount,
+              r.discarded_cash,
+              r.discarded_promotional,
+              r.discarded_admin_credit,
+              r.discarded_legacy,
+              a.activated_by_role
+            from customer_card_returns r
+            join customer_card_activations a
+              on a.id = r.activation_id
+            where r.recharge_point_id = $1
+              and (
+                r.returned_at at time zone $4
+              )::date between $2::date and $3::date
+          ),
 
-            coalesce(sum(r.refund_amount), 0) as refund_amount,
-            coalesce(sum(r.discarded_cash), 0) as discarded_cash,
-            coalesce(sum(r.discarded_promotional), 0) as discarded_promotional,
-            coalesce(sum(r.discarded_admin_credit), 0) as discarded_admin_credit,
-            coalesce(sum(r.discarded_legacy), 0) as discarded_legacy,
-            count(*) as returns_count,
-            count(*) filter (
-              where a.activated_by_role = 'RECHARGE'
-            ) as recharge_origin_returns_count,
-            count(*) filter (
-              where a.activated_by_role = 'ADMIN'
-            ) as admin_origin_returns_count
+          daily as (
+            select
+              cc.report_date,
+              coalesce(sum(cc.total_due_amount) filter (
+                where cc.payment_method = 'CASH'
+              ), 0)::bigint as cash_received,
+              coalesce(sum(cc.total_due_amount) filter (
+                where cc.payment_method = 'CARD'
+              ), 0)::bigint as card_received,
+              coalesce(sum(cc.paid_recharge_amount) filter (
+                where cc.payment_method = 'CASH'
+              ), 0)::bigint as cash_recharge_amount,
+              coalesce(sum(cc.paid_recharge_amount) filter (
+                where cc.payment_method = 'CARD'
+              ), 0)::bigint as card_recharge_amount,
+              0::bigint as legacy_unclassified_received,
+              coalesce(sum(cc.paid_recharge_amount), 0)::bigint
+                as paid_recharge_amount,
+              coalesce(sum(cc.promotional_credit_amount), 0)::bigint
+                as promotional_given,
+              coalesce(sum(cc.credited_amount), 0)::bigint
+                as credited_amount,
+              coalesce(sum(cc.activation_fee_amount), 0)::bigint
+                as activation_amount,
+              coalesce(sum(cc.total_due_amount), 0)::bigint
+                as total_income_amount,
+              count(*)::bigint as operations_count,
+              0::bigint as card_refund_amount,
+              0::bigint as discarded_cash,
+              0::bigint as discarded_promotional,
+              0::bigint as discarded_admin_credit,
+              0::bigint as discarded_legacy,
+              0::bigint as activations_count,
+              0::bigint as returns_count,
+              0::bigint as recharge_origin_returns_count,
+              0::bigint as admin_origin_returns_count
+            from confirmed_checkouts cc
+            group by cc.report_date
 
-          from customer_card_returns r
-          join customer_card_activations a
-            on a.id = r.activation_id
+            union all
 
-          where r.recharge_point_id = $1
-            and (
-              r.returned_at
-              at time zone $4
-            )::date between $2::date and $3::date
+            select
+              lr.report_date,
+              0::bigint as cash_received,
+              0::bigint as card_received,
+              0::bigint as cash_recharge_amount,
+              0::bigint as card_recharge_amount,
+              coalesce(sum(lr.paid_recharge_amount), 0)::bigint
+                as legacy_unclassified_received,
+              coalesce(sum(lr.paid_recharge_amount), 0)::bigint
+                as paid_recharge_amount,
+              coalesce(sum(lr.promotional_given), 0)::bigint
+                as promotional_given,
+              coalesce(sum(lr.credited_amount), 0)::bigint
+                as credited_amount,
+              0::bigint as activation_amount,
+              coalesce(sum(lr.paid_recharge_amount), 0)::bigint
+                as total_income_amount,
+              count(*)::bigint as operations_count,
+              0::bigint as card_refund_amount,
+              0::bigint as discarded_cash,
+              0::bigint as discarded_promotional,
+              0::bigint as discarded_admin_credit,
+              0::bigint as discarded_legacy,
+              0::bigint as activations_count,
+              0::bigint as returns_count,
+              0::bigint as recharge_origin_returns_count,
+              0::bigint as admin_origin_returns_count
+            from legacy_recharges lr
+            group by lr.report_date
 
-          group by report_date
-          order by report_date asc
+            union all
+
+            select
+              la.report_date,
+              0::bigint as cash_received,
+              0::bigint as card_received,
+              0::bigint as cash_recharge_amount,
+              0::bigint as card_recharge_amount,
+              coalesce(sum(la.amount), 0)::bigint
+                as legacy_unclassified_received,
+              0::bigint as paid_recharge_amount,
+              0::bigint as promotional_given,
+              0::bigint as credited_amount,
+              coalesce(sum(la.amount), 0)::bigint as activation_amount,
+              coalesce(sum(la.amount), 0)::bigint as total_income_amount,
+              0::bigint as operations_count,
+              0::bigint as card_refund_amount,
+              0::bigint as discarded_cash,
+              0::bigint as discarded_promotional,
+              0::bigint as discarded_admin_credit,
+              0::bigint as discarded_legacy,
+              0::bigint as activations_count,
+              0::bigint as returns_count,
+              0::bigint as recharge_origin_returns_count,
+              0::bigint as admin_origin_returns_count
+            from legacy_activations la
+            group by la.report_date
+
+            union all
+
+            select
+              ac.report_date,
+              0::bigint as cash_received,
+              0::bigint as card_received,
+              0::bigint as cash_recharge_amount,
+              0::bigint as card_recharge_amount,
+              0::bigint as legacy_unclassified_received,
+              0::bigint as paid_recharge_amount,
+              0::bigint as promotional_given,
+              0::bigint as credited_amount,
+              0::bigint as activation_amount,
+              0::bigint as total_income_amount,
+              0::bigint as operations_count,
+              0::bigint as card_refund_amount,
+              0::bigint as discarded_cash,
+              0::bigint as discarded_promotional,
+              0::bigint as discarded_admin_credit,
+              0::bigint as discarded_legacy,
+              ac.activations_count,
+              0::bigint as returns_count,
+              0::bigint as recharge_origin_returns_count,
+              0::bigint as admin_origin_returns_count
+            from activation_counts ac
+
+            union all
+
+            select
+              r.report_date,
+              0::bigint as cash_received,
+              0::bigint as card_received,
+              0::bigint as cash_recharge_amount,
+              0::bigint as card_recharge_amount,
+              0::bigint as legacy_unclassified_received,
+              0::bigint as paid_recharge_amount,
+              0::bigint as promotional_given,
+              0::bigint as credited_amount,
+              0::bigint as activation_amount,
+              0::bigint as total_income_amount,
+              0::bigint as operations_count,
+              coalesce(sum(r.refund_amount), 0)::bigint
+                as card_refund_amount,
+              coalesce(sum(r.discarded_cash), 0)::bigint
+                as discarded_cash,
+              coalesce(sum(r.discarded_promotional), 0)::bigint
+                as discarded_promotional,
+              coalesce(sum(r.discarded_admin_credit), 0)::bigint
+                as discarded_admin_credit,
+              coalesce(sum(r.discarded_legacy), 0)::bigint
+                as discarded_legacy,
+              0::bigint as activations_count,
+              count(*)::bigint as returns_count,
+              count(*) filter (
+                where r.activated_by_role = 'RECHARGE'
+              )::bigint as recharge_origin_returns_count,
+              count(*) filter (
+                where r.activated_by_role = 'ADMIN'
+              )::bigint as admin_origin_returns_count
+            from returns r
+            group by r.report_date
+          )
+
+          select
+            to_char(d.report_date, 'YYYY-MM-DD') as report_date,
+            coalesce(sum(d.cash_received), 0) as cash_received,
+            coalesce(sum(d.card_received), 0) as card_received,
+            coalesce(sum(d.cash_recharge_amount), 0) as cash_recharge_amount,
+            coalesce(sum(d.card_recharge_amount), 0) as card_recharge_amount,
+            coalesce(sum(d.legacy_unclassified_received), 0)
+              as legacy_unclassified_received,
+            coalesce(sum(d.paid_recharge_amount), 0)
+              as paid_recharge_amount,
+            coalesce(sum(d.promotional_given), 0) as promotional_given,
+            coalesce(sum(d.credited_amount), 0) as credited_amount,
+            coalesce(sum(d.activation_amount), 0) as activation_amount,
+            coalesce(sum(d.total_income_amount), 0) as total_income_amount,
+            coalesce(sum(d.operations_count), 0) as operations_count,
+            coalesce(sum(d.card_refund_amount), 0) as card_refund_amount,
+            coalesce(sum(d.discarded_cash), 0) as discarded_cash,
+            coalesce(sum(d.discarded_promotional), 0)
+              as discarded_promotional,
+            coalesce(sum(d.discarded_admin_credit), 0)
+              as discarded_admin_credit,
+            coalesce(sum(d.discarded_legacy), 0) as discarded_legacy,
+            coalesce(sum(d.activations_count), 0) as activations_count,
+            coalesce(sum(d.returns_count), 0) as returns_count,
+            coalesce(sum(d.recharge_origin_returns_count), 0)
+              as recharge_origin_returns_count,
+            coalesce(sum(d.admin_origin_returns_count), 0)
+              as admin_origin_returns_count
+          from daily d
+          group by d.report_date
+          order by d.report_date asc
           `,
           [rechargePointId, from, to, REPORT_TIMEZONE]
         );
 
         let cashReceived = 0;
+        let cardReceived = 0;
+        let cashRechargeAmount = 0;
+        let cardRechargeAmount = 0;
+        let legacyUnclassifiedReceived = 0;
+        let paidRechargeAmount = 0;
         let promotionalGiven = 0;
         let creditedAmount = 0;
-        const dailyMap = new Map<string, any>();
+        let activationAmount = 0;
+        let totalIncomeAmount = 0;
+        let operationsCount = 0;
+
+        let cardRefundAmount = 0;
+        let discardedCash = 0;
+        let discardedPromotional = 0;
+        let discardedAdminCredit = 0;
+        let discardedLegacy = 0;
+        let activationsCount = 0;
+        let returnsCount = 0;
+        let rechargeOriginReturnsCount = 0;
+        let adminOriginReturnsCount = 0;
+
+        const dailyBreakdown = financialResult.rows.map((row: any) => {
+          const dailyCash = Number(row.cash_received);
+          const dailyCard = Number(row.card_received);
+          const dailyCashRecharge = Number(row.cash_recharge_amount);
+          const dailyCardRecharge = Number(row.card_recharge_amount);
+          const dailyLegacyUnclassified =
+            Number(row.legacy_unclassified_received);
+          const dailyPaidRecharge = Number(row.paid_recharge_amount);
+          const dailyPromotional = Number(row.promotional_given);
+          const dailyCredited = Number(row.credited_amount);
+          const dailyActivation = Number(row.activation_amount);
+          const dailyIncome = Number(row.total_income_amount);
+          const dailyOperations = Number(row.operations_count);
+
+          const dailyRefund = Number(row.card_refund_amount);
+          const dailyDiscardedCash = Number(row.discarded_cash);
+          const dailyDiscardedPromotional =
+            Number(row.discarded_promotional);
+          const dailyDiscardedAdminCredit =
+            Number(row.discarded_admin_credit);
+          const dailyDiscardedLegacy =
+            Number(row.discarded_legacy);
+          const dailyDiscardedTotal =
+            dailyDiscardedCash +
+            dailyDiscardedPromotional +
+            dailyDiscardedAdminCredit +
+            dailyDiscardedLegacy;
+          const dailyActivationsCount = Number(row.activations_count);
+          const dailyReturnsCount = Number(row.returns_count);
+          const dailyRechargeOriginReturnsCount =
+            Number(row.recharge_origin_returns_count);
+          const dailyAdminOriginReturnsCount =
+            Number(row.admin_origin_returns_count);
+
+          cashReceived += dailyCash;
+          cardReceived += dailyCard;
+          cashRechargeAmount += dailyCashRecharge;
+          cardRechargeAmount += dailyCardRecharge;
+          legacyUnclassifiedReceived += dailyLegacyUnclassified;
+          paidRechargeAmount += dailyPaidRecharge;
+          promotionalGiven += dailyPromotional;
+          creditedAmount += dailyCredited;
+          activationAmount += dailyActivation;
+          totalIncomeAmount += dailyIncome;
+          operationsCount += dailyOperations;
+
+          cardRefundAmount += dailyRefund;
+          discardedCash += dailyDiscardedCash;
+          discardedPromotional += dailyDiscardedPromotional;
+          discardedAdminCredit += dailyDiscardedAdminCredit;
+          discardedLegacy += dailyDiscardedLegacy;
+          activationsCount += dailyActivationsCount;
+          returnsCount += dailyReturnsCount;
+          rechargeOriginReturnsCount += dailyRechargeOriginReturnsCount;
+          adminOriginReturnsCount += dailyAdminOriginReturnsCount;
+
+          return {
+            date: row.report_date,
+
+            cashReceived: dailyCash,
+            cardReceived: dailyCard,
+            cashRechargeAmount: dailyCashRecharge,
+            cardRechargeAmount: dailyCardRecharge,
+            legacyUnclassifiedReceived: dailyLegacyUnclassified,
+            paidRechargeAmount: dailyPaidRecharge,
+            promotionalGiven: dailyPromotional,
+            creditedAmount: dailyCredited,
+            activationAmount: dailyActivation,
+            totalIncomeAmount: dailyIncome,
+            operationsCount: dailyOperations,
+
+            cardRefundAmount: dailyRefund,
+            discardedCash: dailyDiscardedCash,
+            discardedPromotional: dailyDiscardedPromotional,
+            discardedAdminCredit: dailyDiscardedAdminCredit,
+            discardedLegacy: dailyDiscardedLegacy,
+            discardedTotal: dailyDiscardedTotal,
+            activationsCount: dailyActivationsCount,
+            returnsCount: dailyReturnsCount,
+            rechargeOriginReturnsCount: dailyRechargeOriginReturnsCount,
+            adminOriginReturnsCount: dailyAdminOriginReturnsCount,
+          };
+        });
 
         const transactions = transactionsResult.rows.map((row: any) => {
-          const cash = Number(row.cash_received);
+          const checkoutId =
+            row.checkout_id === null ? null : String(row.checkout_id);
+          const paid = Number(row.paid_recharge_amount);
           const promotional = Number(row.promotional_given);
           const credited = Number(row.amount);
-
-          cashReceived += cash;
-          promotionalGiven += promotional;
-          creditedAmount += credited;
-
-          const operationDate = row.confirmed_at ?? row.created_at;
-          const localDate = new Intl.DateTimeFormat("en-CA", {
-            timeZone: REPORT_TIMEZONE,
-            year: "numeric",
-            month: "2-digit",
-            day: "2-digit",
-          }).format(new Date(operationDate));
-
-          let daily = dailyMap.get(localDate);
-          if (daily === undefined) {
-            daily = {
-              date: localDate,
-              cashReceived: 0,
-              promotionalGiven: 0,
-              creditedAmount: 0,
-              activationAmount: 0,
-              totalIncomeAmount: 0,
-
-              cardRefundAmount: 0,
-              discardedCash: 0,
-              discardedPromotional: 0,
-              discardedAdminCredit: 0,
-              discardedLegacy: 0,
-              discardedTotal: 0,
-              activationsCount: 0,
-              returnsCount: 0,
-              rechargeOriginReturnsCount: 0,
-              adminOriginReturnsCount: 0,
-
-              operationsCount: 0,
-            };
-            dailyMap.set(localDate, daily);
-          }
-
-          daily.cashReceived += cash;
-          daily.promotionalGiven += promotional;
-          daily.creditedAmount += credited;
-          daily.totalIncomeAmount += cash;
-          daily.operationsCount += 1;
+          const cash = Number(row.cash_received);
+          const card = Number(row.card_received);
+          const legacy = Number(row.legacy_unclassified_received);
 
           return {
             transactionId: row.id,
             cardId: Number(row.card_id),
             deviceId: row.device_id,
+
+            checkoutId,
+            cardPath: row.card_path,
+            paymentMethod: row.payment_method,
+            checkoutStatus: row.checkout_status,
+
+            paidRechargeAmount: paid,
             creditedAmount: credited,
             cashReceived: cash,
+            cardReceived: card,
+            legacyUnclassifiedReceived: legacy,
             promotionalGiven: promotional,
+            activationFeeAmount:
+              row.checkout_activation_fee_amount === null
+                ? 0
+                : Number(row.checkout_activation_fee_amount),
+            totalDueAmount:
+              row.checkout_total_due_amount === null
+                ? paid
+                : Number(row.checkout_total_due_amount),
+
             adminCreditAmount: Number(row.admin_credit_amount),
             balanceBefore: Number(row.balance_before),
             balanceAfter: Number(row.balance_after),
             counterBefore: Number(row.counter_before),
             counterAfter: Number(row.counter_after),
             status: row.card_write_status,
+
             promotion:
               row.promotion_id === null
                 ? null
@@ -1353,157 +1997,11 @@ export async function webAdminReportRoutes(server: FastifyInstance) {
                     promotionalAmount: Number(row.promotion_promotional_amount),
                     creditedAmount: Number(row.promotion_total_credit_amount),
                   },
+
             createdAt: row.created_at,
             confirmedAt: row.confirmed_at,
           };
         });
-
-        let activationAmount = 0;
-        let activationsCount = 0;
-
-        let cardRefundAmount = 0;
-        let discardedCash = 0;
-        let discardedPromotional = 0;
-        let discardedAdminCredit = 0;
-        let discardedLegacy = 0;
-        let returnsCount = 0;
-        let rechargeOriginReturnsCount = 0;
-        let adminOriginReturnsCount = 0;
-
-        for (const row of activationResult.rows) {
-          const amount = Number(row.activation_amount);
-          activationAmount += amount;
-          let daily = dailyMap.get(row.report_date);
-          if (daily === undefined) {
-            daily = {
-              date: row.report_date,
-              cashReceived: 0,
-              promotionalGiven: 0,
-              creditedAmount: 0,
-              activationAmount: 0,
-              totalIncomeAmount: 0,
-
-              cardRefundAmount: 0,
-              discardedCash: 0,
-              discardedPromotional: 0,
-              discardedAdminCredit: 0,
-              discardedLegacy: 0,
-              discardedTotal: 0,
-              activationsCount: 0,
-              returnsCount: 0,
-              rechargeOriginReturnsCount: 0,
-              adminOriginReturnsCount: 0,
-
-              operationsCount: 0,
-            };
-            dailyMap.set(row.report_date, daily);
-          }
-          daily.activationAmount += amount;
-          daily.totalIncomeAmount += amount;
-        }
-
-        for (const row of activationCountResult.rows) {
-          const count = Number(row.activations_count);
-          activationsCount += count;
-
-          let daily = dailyMap.get(row.report_date);
-
-          if (daily === undefined) {
-            daily = {
-              date: row.report_date,
-              cashReceived: 0,
-              promotionalGiven: 0,
-              creditedAmount: 0,
-              activationAmount: 0,
-              totalIncomeAmount: 0,
-
-              cardRefundAmount: 0,
-              discardedCash: 0,
-              discardedPromotional: 0,
-              discardedAdminCredit: 0,
-              discardedLegacy: 0,
-              discardedTotal: 0,
-              activationsCount: 0,
-              returnsCount: 0,
-              rechargeOriginReturnsCount: 0,
-              adminOriginReturnsCount: 0,
-
-              operationsCount: 0,
-            };
-
-            dailyMap.set(row.report_date, daily);
-          }
-
-          daily.activationsCount += count;
-        }
-
-        for (const row of returnsResult.rows) {
-          const refund = Number(row.refund_amount);
-          const cash = Number(row.discarded_cash);
-          const promotional = Number(row.discarded_promotional);
-          const adminCredit = Number(row.discarded_admin_credit);
-          const legacy = Number(row.discarded_legacy);
-          const count = Number(row.returns_count);
-          const rechargeOriginCount =
-            Number(row.recharge_origin_returns_count);
-          const adminOriginCount =
-            Number(row.admin_origin_returns_count);
-
-          cardRefundAmount += refund;
-          discardedCash += cash;
-          discardedPromotional += promotional;
-          discardedAdminCredit += adminCredit;
-          discardedLegacy += legacy;
-          returnsCount += count;
-          rechargeOriginReturnsCount += rechargeOriginCount;
-          adminOriginReturnsCount += adminOriginCount;
-
-          let daily = dailyMap.get(row.report_date);
-
-          if (daily === undefined) {
-            daily = {
-              date: row.report_date,
-              cashReceived: 0,
-              promotionalGiven: 0,
-              creditedAmount: 0,
-              activationAmount: 0,
-              totalIncomeAmount: 0,
-
-              cardRefundAmount: 0,
-              discardedCash: 0,
-              discardedPromotional: 0,
-              discardedAdminCredit: 0,
-              discardedLegacy: 0,
-              discardedTotal: 0,
-              activationsCount: 0,
-              returnsCount: 0,
-              rechargeOriginReturnsCount: 0,
-              adminOriginReturnsCount: 0,
-
-              operationsCount: 0,
-            };
-
-            dailyMap.set(row.report_date, daily);
-          }
-
-          daily.cardRefundAmount += refund;
-          daily.discardedCash += cash;
-          daily.discardedPromotional += promotional;
-          daily.discardedAdminCredit += adminCredit;
-          daily.discardedLegacy += legacy;
-          daily.discardedTotal +=
-            cash +
-            promotional +
-            adminCredit +
-            legacy;
-          daily.returnsCount += count;
-          daily.rechargeOriginReturnsCount += rechargeOriginCount;
-          daily.adminOriginReturnsCount += adminOriginCount;
-        }
-
-        const dailyBreakdown = Array.from(dailyMap.values()).sort(
-          (a: any, b: any) => a.date.localeCompare(b.date)
-        );
 
         return {
           from,
@@ -1515,10 +2013,15 @@ export async function webAdminReportRoutes(server: FastifyInstance) {
           },
           summary: {
             cashReceived,
+            cardReceived,
+            cashRechargeAmount,
+            cardRechargeAmount,
+            legacyUnclassifiedReceived,
+            paidRechargeAmount,
             promotionalGiven,
             creditedAmount,
             activationAmount,
-            totalIncomeAmount: cashReceived + activationAmount,
+            totalIncomeAmount,
 
             cardRefundAmount,
             discardedCash,
@@ -1535,7 +2038,7 @@ export async function webAdminReportRoutes(server: FastifyInstance) {
             rechargeOriginReturnsCount,
             adminOriginReturnsCount,
 
-            operationsCount: transactions.length,
+            operationsCount,
           },
           dailyBreakdown,
           transactions,
@@ -1544,6 +2047,7 @@ export async function webAdminReportRoutes(server: FastifyInstance) {
         if (error?.code === "22P02") {
           return reply.status(400).send({ error: "INVALID_RECHARGE_POINT_ID" });
         }
+
         server.log.error(error);
         return reply.status(500).send({ error: "INTERNAL_ERROR" });
       } finally {

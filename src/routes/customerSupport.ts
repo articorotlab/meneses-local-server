@@ -14,6 +14,16 @@ type CardHistoryBody = {
 };
 
 
+type CardHistoryPaymentMethodChangeBody = {
+  checkoutId: string;
+  cardId: number;
+  uid: string;
+  deviceCode: string;
+  newPaymentMethod: "CASH" | "CARD";
+  reason?: string;
+};
+
+
 type CardReturnAuthorizeBody = {
   idempotencyKey: string;
   cardId: number;
@@ -520,7 +530,24 @@ export async function customerSupportRoutes(
 
               rp.recharge_code,
 
-              rp.name as recharge_point_name
+              rp.name as recharge_point_name,
+
+              rc.id as checkout_id,
+
+              coalesce(
+                rc.promotion_id,
+                t.promotion_id
+              ) as promotion_id,
+
+              p.name as promotion_name,
+
+              rc.paid_recharge_amount,
+
+              rc.promotional_credit_amount,
+
+              rc.credited_amount,
+
+              rc.payment_method
 
           from transactions t
 
@@ -532,6 +559,16 @@ export async function customerSupportRoutes(
 
           left join recharge_points rp
               on rp.id = t.recharge_point_id
+
+          left join recharge_checkouts rc
+              on rc.recharge_transaction_id = t.id
+             and rc.status = 'CONFIRMED'
+
+          left join promotions p
+              on p.id = coalesce(
+                rc.promotion_id,
+                t.promotion_id
+              )
 
           where t.card_id = $1
             and t.activation_id = $2
@@ -640,6 +677,43 @@ export async function customerSupportRoutes(
                         row.recharge_point_name,
                     }
                   : null,
+
+              checkoutId:
+                row.checkout_id,
+
+              promotionId:
+                row.promotion_id,
+
+              promotionName:
+                row.promotion_name,
+
+              paidRechargeAmount:
+                row.paid_recharge_amount !== null
+                  ? Number(
+                      row.paid_recharge_amount
+                    )
+                  : null,
+
+              promotionalCreditAmount:
+                row.promotional_credit_amount !== null
+                  ? Number(
+                      row.promotional_credit_amount
+                    )
+                  : null,
+
+              creditedAmount:
+                row.credited_amount !== null
+                  ? Number(
+                      row.credited_amount
+                    )
+                  : null,
+
+              paymentMethod:
+                row.payment_method,
+
+              paymentMethodEditable:
+                row.checkout_id !== null &&
+                row.payment_method !== null,
 
               deviceCode:
                 row.device_code,
@@ -900,6 +974,759 @@ export async function customerSupportRoutes(
 
         history,
       };
+    }
+  );
+
+
+  /*
+   * =====================================================
+   * CORREGIR MÉTODO DE PAGO DESDE HISTORIAL CUSTOMER
+   * =====================================================
+   *
+   * POST /customer-support/card-history/payment-method
+   *
+   * Este endpoint SOLO corrige la clasificación física
+   * CASH / CARD de un checkout ya CONFIRMED.
+   *
+   * No modifica:
+   * - saldo NFC;
+   * - cards.balance / transaction_counter;
+   * - transactions;
+   * - Financial Ledger V2.
+   *
+   * La evidencia anterior se conserva en
+   * recharge_checkout_payment_method_changes.
+   * =====================================================
+   */
+
+  server.post<{
+    Body:
+      CardHistoryPaymentMethodChangeBody;
+  }>(
+    "/customer-support/card-history/payment-method",
+
+    async (
+      request,
+      reply
+    ) => {
+
+      const {
+        checkoutId,
+        cardId,
+        uid,
+        deviceCode,
+        newPaymentMethod,
+        reason,
+      } =
+        request.body;
+
+
+      if (
+        typeof checkoutId !==
+          "string" ||
+        checkoutId
+          .trim()
+          .length ===
+          0
+      ) {
+
+        return reply
+          .status(400)
+          .send({
+            error:
+              "INVALID_CHECKOUT_ID",
+          });
+      }
+
+
+      if (
+        !Number.isSafeInteger(
+          cardId
+        ) ||
+        cardId <=
+          0
+      ) {
+
+        return reply
+          .status(400)
+          .send({
+            error:
+              "INVALID_CARD_ID",
+          });
+      }
+
+
+      if (
+        typeof uid !==
+          "string" ||
+        uid
+          .trim()
+          .length ===
+          0
+      ) {
+
+        return reply
+          .status(400)
+          .send({
+            error:
+              "INVALID_UID",
+          });
+      }
+
+
+      if (
+        typeof deviceCode !==
+          "string" ||
+        deviceCode
+          .trim()
+          .length ===
+          0
+      ) {
+
+        return reply
+          .status(400)
+          .send({
+            error:
+              "INVALID_DEVICE_CODE",
+          });
+      }
+
+
+      if (
+        newPaymentMethod !==
+          "CASH" &&
+        newPaymentMethod !==
+          "CARD"
+      ) {
+
+        return reply
+          .status(400)
+          .send({
+            error:
+              "INVALID_PAYMENT_METHOD",
+
+            message:
+              "El método debe ser CASH o CARD.",
+          });
+      }
+
+
+      const normalizedUid =
+        uid
+          .trim()
+          .toUpperCase();
+
+
+      const normalizedDeviceCode =
+        deviceCode.trim();
+
+
+      const normalizedReason =
+        typeof reason ===
+          "string" &&
+        reason
+          .trim()
+          .length >
+          0
+          ? reason
+              .trim()
+              .slice(
+                0,
+                500
+              )
+          : "Corrección desde historial CUSTOMER";
+
+
+      const client =
+        await db.connect();
+
+
+      try {
+
+        await client.query(
+          "BEGIN"
+        );
+
+
+        const deviceResult =
+          await client.query(
+            `
+            select
+                id,
+                status
+
+            from devices
+
+            where device_code = $1
+
+            limit 1
+
+            for update
+            `,
+            [
+              normalizedDeviceCode,
+            ]
+          );
+
+
+        if (
+          deviceResult.rowCount ===
+          0
+        ) {
+
+          await client.query(
+            "ROLLBACK"
+          );
+
+
+          return reply
+            .status(404)
+            .send({
+              error:
+                "DEVICE_NOT_FOUND",
+            });
+        }
+
+
+        const device =
+          deviceResult.rows[0];
+
+
+        if (
+          device.status !==
+          "ACTIVE"
+        ) {
+
+          await client.query(
+            "ROLLBACK"
+          );
+
+
+          return reply
+            .status(409)
+            .send({
+              error:
+                "DEVICE_NOT_ACTIVE",
+            });
+        }
+
+
+        /*
+         * ADMIN tiene prioridad si por un error operativo
+         * coexistieran ambas sesiones.
+         */
+        const adminSessionResult =
+          await client.query(
+            `
+            select
+                s.id,
+                s.admin_card_id
+
+            from device_admin_sessions s
+
+            where s.device_id = $1
+              and s.status = 'ACTIVE'
+              and s.ended_at is null
+
+            limit 1
+            `,
+            [
+              device.id,
+            ]
+          );
+
+
+        const rechargeSessionResult =
+          await client.query(
+            `
+            select
+                s.id,
+                s.opened_by_card_id,
+                s.recharge_point_id
+
+            from device_recharge_sessions s
+
+            where s.device_id = $1
+              and s.status = 'ACTIVE'
+              and s.ended_at is null
+
+            limit 1
+            `,
+            [
+              device.id,
+            ]
+          );
+
+
+        let changedByRole:
+          "ADMIN" |
+          "RECHARGE";
+
+
+        let changedByCardId:
+          number;
+
+
+        let activeRechargePointId:
+          string | null =
+            null;
+
+
+        if (
+          adminSessionResult.rowCount &&
+          adminSessionResult.rowCount >
+            0
+        ) {
+
+          changedByRole =
+            "ADMIN";
+
+
+          changedByCardId =
+            Number(
+              adminSessionResult
+                .rows[0]
+                .admin_card_id
+            );
+
+
+        } else if (
+          rechargeSessionResult.rowCount &&
+          rechargeSessionResult.rowCount >
+            0
+        ) {
+
+          const rechargeSession =
+            rechargeSessionResult
+              .rows[0];
+
+
+          if (
+            rechargeSession
+              .opened_by_card_id ===
+            null
+          ) {
+
+            await client.query(
+              "ROLLBACK"
+            );
+
+
+            return reply
+              .status(409)
+              .send({
+                error:
+                  "RECHARGE_SESSION_HAS_NO_CARD",
+              });
+          }
+
+
+          changedByRole =
+            "RECHARGE";
+
+
+          changedByCardId =
+            Number(
+              rechargeSession
+                .opened_by_card_id
+            );
+
+
+          activeRechargePointId =
+            rechargeSession
+              .recharge_point_id;
+
+
+        } else {
+
+          await client.query(
+            "ROLLBACK"
+          );
+
+
+          return reply
+            .status(403)
+            .send({
+              error:
+                "CUSTOMER_SUPPORT_PERMISSION_REQUIRED",
+
+              message:
+                "Se necesita una sesión ADMIN o RECHARGE activa para corregir el método de pago.",
+            });
+        }
+
+
+        const checkoutResult =
+          await client.query(
+            `
+            select
+                rc.id,
+                rc.card_id,
+                rc.target_uid,
+                rc.actor_role,
+                rc.recharge_point_id,
+                rc.recharge_transaction_id,
+                rc.payment_method,
+                rc.status,
+
+                c.current_activation_id,
+                c.financial_hold,
+
+                t.activation_id
+                  as transaction_activation_id
+
+            from recharge_checkouts rc
+
+            join cards c
+                on c.card_id =
+                   rc.card_id
+
+            join transactions t
+                on t.id =
+                   rc.recharge_transaction_id
+
+            where rc.id = $1
+
+            limit 1
+
+            for update of rc
+            `,
+            [
+              checkoutId.trim(),
+            ]
+          );
+
+
+        if (
+          checkoutResult.rowCount ===
+          0
+        ) {
+
+          await client.query(
+            "ROLLBACK"
+          );
+
+
+          return reply
+            .status(404)
+            .send({
+              error:
+                "CHECKOUT_NOT_FOUND",
+            });
+        }
+
+
+        const checkout =
+          checkoutResult.rows[0];
+
+
+        if (
+          Number(
+            checkout.card_id
+          ) !==
+          cardId ||
+          String(
+            checkout.target_uid
+          )
+            .trim()
+            .toUpperCase() !==
+          normalizedUid
+        ) {
+
+          await client.query(
+            "ROLLBACK"
+          );
+
+
+          return reply
+            .status(409)
+            .send({
+              error:
+                "CHECKOUT_CARD_MISMATCH",
+
+              message:
+                "El checkout no corresponde a la tarjeta consultada.",
+            });
+        }
+
+
+        if (
+          checkout.status !==
+          "CONFIRMED"
+        ) {
+
+          await client.query(
+            "ROLLBACK"
+          );
+
+
+          return reply
+            .status(409)
+            .send({
+              error:
+                "CHECKOUT_NOT_CONFIRMED",
+
+              message:
+                "Solo se puede corregir el método de pago de operaciones confirmadas.",
+            });
+        }
+
+
+        if (
+          checkout.actor_role !==
+          "RECHARGE"
+        ) {
+
+          await client.query(
+            "ROLLBACK"
+          );
+
+
+          return reply
+            .status(409)
+            .send({
+              error:
+                "CHECKOUT_NOT_RECHARGE",
+
+              message:
+                "La operación no corresponde a un cobro de taquilla.",
+            });
+        }
+
+
+        if (
+          checkout.payment_method !==
+            "CASH" &&
+          checkout.payment_method !==
+            "CARD"
+        ) {
+
+          await client.query(
+            "ROLLBACK"
+          );
+
+
+          return reply
+            .status(409)
+            .send({
+              error:
+                "CHECKOUT_PAYMENT_METHOD_NOT_EDITABLE",
+
+              message:
+                "La operación no tiene un método de pago corregible.",
+            });
+        }
+
+
+        if (
+          checkout.financial_hold ===
+          true
+        ) {
+
+          await client.query(
+            "ROLLBACK"
+          );
+
+
+          return reply
+            .status(409)
+            .send({
+              error:
+                "CARD_FINANCIAL_HOLD",
+
+              message:
+                "La tarjeta está en revisión manual. No se puede corregir el método de pago hasta resolver el incidente.",
+            });
+        }
+
+
+        /*
+         * Una TAQUILLA solamente puede corregir operaciones
+         * pertenecientes a su propio punto de recarga.
+         * ADMIN puede corregir cualquier checkout confirmado.
+         */
+        if (
+          changedByRole ===
+            "RECHARGE" &&
+          checkout.recharge_point_id !==
+            activeRechargePointId
+        ) {
+
+          await client.query(
+            "ROLLBACK"
+          );
+
+
+          return reply
+            .status(403)
+            .send({
+              error:
+                "CHECKOUT_BELONGS_TO_ANOTHER_RECHARGE_POINT",
+
+              message:
+                "Esta operación pertenece a otra taquilla.",
+            });
+        }
+
+
+        /*
+         * El historial mostrado corresponde únicamente a la
+         * activación CUSTOMER actual. No permitimos modificar
+         * desde aquí un checkout perteneciente a otra activación.
+         */
+        if (
+          checkout.current_activation_id ===
+            null ||
+          checkout.transaction_activation_id ===
+            null ||
+          checkout.current_activation_id !==
+            checkout.transaction_activation_id
+        ) {
+
+          await client.query(
+            "ROLLBACK"
+          );
+
+
+          return reply
+            .status(409)
+            .send({
+              error:
+                "CHECKOUT_NOT_IN_CURRENT_ACTIVATION",
+
+              message:
+                "La operación no pertenece a la activación actual de la tarjeta.",
+            });
+        }
+
+
+        const previousMethod =
+          String(
+            checkout.payment_method
+          );
+
+
+        if (
+          previousMethod ===
+          newPaymentMethod
+        ) {
+
+          await client.query(
+            "COMMIT"
+          );
+
+
+          return {
+            changed:
+              false,
+
+            checkoutId:
+              checkout.id,
+
+            previousMethod,
+
+            newMethod:
+              previousMethod,
+          };
+        }
+
+
+        await client.query(
+          `
+          insert into recharge_checkout_payment_method_changes (
+              checkout_id,
+              previous_method,
+              new_method,
+              changed_by_role,
+              changed_by_card_id,
+              device_id,
+              reason
+          )
+          values (
+              $1,
+              $2,
+              $3,
+              $4,
+              $5,
+              $6,
+              $7
+          )
+          `,
+          [
+            checkout.id,
+            previousMethod,
+            newPaymentMethod,
+            changedByRole,
+            changedByCardId,
+            device.id,
+            normalizedReason,
+          ]
+        );
+
+
+        await client.query(
+          `
+          update recharge_checkouts
+
+          set
+              payment_method = $2,
+              updated_at = now()
+
+          where id = $1
+          `,
+          [
+            checkout.id,
+            newPaymentMethod,
+          ]
+        );
+
+
+        await client.query(
+          "COMMIT"
+        );
+
+
+        return {
+          changed:
+            true,
+
+          checkoutId:
+            checkout.id,
+
+          previousMethod,
+
+          newMethod:
+            newPaymentMethod,
+
+          changedByRole,
+
+          changedByCardId,
+        };
+
+
+      } catch (
+        error
+      ) {
+
+        try {
+
+          await client.query(
+            "ROLLBACK"
+          );
+
+        } catch (
+          _: unknown
+        ) {
+        }
+
+
+        throw error;
+
+
+      } finally {
+
+        client.release();
+      }
     }
   );
 
