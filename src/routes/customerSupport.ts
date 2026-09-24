@@ -32,6 +32,27 @@ type CardReturnAuthorizeBody = {
 };
 
 
+type CardReturnResumeBody = {
+  cardId: number;
+  uid: string;
+  deviceCode: string;
+};
+
+
+type CardReturnReconcileBody = {
+  operationId: string;
+  cardId: number;
+  uid: string;
+  deviceCode: string;
+
+  physicalCardId: number;
+  physicalCardType: string;
+  physicalStatus: string;
+  physicalBalance: number;
+  physicalTransactionCounter: number;
+};
+
+
 type CardReturnConfirmBody = {
   operationId: string;
   cardId: number;
@@ -2501,6 +2522,1305 @@ export async function customerSupportRoutes(
           "ACTIVATION_CARD_MISMATCH",
           "ACTIVATION_NOT_ACTIVE",
           "ACTIVATION_NOT_FOUND_AFTER_RETURN_AUTHORIZATION",
+        ];
+
+
+        const knownError =
+          knownConflictErrors.find(
+            (code) =>
+              message.includes(
+                code
+              )
+          );
+
+
+        if (
+          knownError
+        ) {
+
+          return reply
+            .status(409)
+            .send({
+              error:
+                knownError,
+            });
+        }
+
+
+        server.log.error(
+          error
+        );
+
+
+        return reply
+          .status(500)
+          .send({
+            error:
+              "INTERNAL_ERROR",
+          });
+
+
+      } finally {
+
+        client.release();
+      }
+    }
+  );
+
+
+  /*
+   * =====================================================
+   * REANUDAR DEVOLUCIÓN / RESET PENDIENTE
+   * =====================================================
+   *
+   * POST /customer-support/card-return/resume
+   *
+   * READ-ONLY:
+   * - no escribe NFC;
+   * - no confirma ni falla la devolución;
+   * - no modifica cards, activaciones, transacciones ni ledger.
+   *
+   * Busca una operación AUTHORIZED de la misma tarjeta/UID
+   * y del mismo dispositivo, y revalida que la sesión que la
+   * autorizó siga activa.
+   * =====================================================
+   */
+
+  server.post<{
+    Body:
+      CardReturnResumeBody;
+  }>(
+    "/customer-support/card-return/resume",
+
+    async (
+      request,
+      reply
+    ) => {
+
+      const {
+        cardId,
+        uid,
+        deviceCode,
+      } = request.body;
+
+
+      if (
+        !Number.isSafeInteger(
+          cardId
+        ) ||
+        cardId <= 0
+      ) {
+
+        return reply
+          .status(400)
+          .send({
+            error:
+              "INVALID_CARD_ID",
+            message:
+              "Card ID inválido.",
+          });
+      }
+
+
+      if (
+        typeof uid !==
+          "string" ||
+        uid.trim().length ===
+          0
+      ) {
+
+        return reply
+          .status(400)
+          .send({
+            error:
+              "INVALID_UID",
+          });
+      }
+
+
+      if (
+        typeof deviceCode !==
+          "string" ||
+        deviceCode.trim().length ===
+          0
+      ) {
+
+        return reply
+          .status(400)
+          .send({
+            error:
+              "INVALID_DEVICE_CODE",
+          });
+      }
+
+
+      const normalizedUid =
+        uid
+          .trim()
+          .toUpperCase();
+
+      const normalizedDeviceCode =
+        deviceCode.trim();
+
+
+      const deviceResult =
+        await db.query(
+          `
+            select
+              id,
+              status
+            from devices
+            where device_code = $1
+            limit 1
+          `,
+          [
+            normalizedDeviceCode,
+          ]
+        );
+
+
+      if (
+        deviceResult.rowCount ===
+        0
+      ) {
+
+        return reply
+          .status(404)
+          .send({
+            error:
+              "DEVICE_NOT_FOUND",
+          });
+      }
+
+
+      const device =
+        deviceResult.rows[0];
+
+
+      if (
+        device.status !==
+        "ACTIVE"
+      ) {
+
+        return reply
+          .status(409)
+          .send({
+            error:
+              "DEVICE_NOT_ACTIVE",
+          });
+      }
+
+
+      const operationResult =
+        await db.query(
+          `
+            select
+              cro.id,
+              cro.device_id,
+              cro.card_id,
+              cro.activation_id,
+              cro.uid,
+              cro.returned_by_role,
+              cro.returned_by_card_id,
+              cro.recharge_point_id,
+              cro.activation_fee,
+              cro.refund_amount,
+              cro.balance_before,
+              cro.counter_before,
+              cro.discarded_cash,
+              cro.discarded_promotional,
+              cro.discarded_admin_credit,
+              cro.discarded_legacy,
+              cro.status,
+              cro.authorized_at,
+              a.activated_by_role,
+              a.activation_fee_known,
+              rp.recharge_code,
+              rp.name as recharge_point_name
+            from customer_card_return_operations cro
+            join customer_card_activations a
+              on a.id = cro.activation_id
+             and a.card_id = cro.card_id
+            left join recharge_points rp
+              on rp.id = cro.recharge_point_id
+            where cro.device_id = $1
+              and cro.card_id = $2
+              and upper(trim(cro.uid)) = $3
+              and cro.status = 'AUTHORIZED'
+            order by cro.authorized_at desc
+            limit 1
+          `,
+          [
+            device.id,
+            cardId,
+            normalizedUid,
+          ]
+        );
+
+
+      if (
+        operationResult.rowCount ===
+        0
+      ) {
+
+        return {
+          found:
+            false,
+        };
+      }
+
+
+      const operation =
+        operationResult.rows[0];
+
+
+      let sessionStillActive =
+        false;
+
+
+      if (
+        operation.returned_by_role ===
+        "ADMIN"
+      ) {
+
+        const sessionResult =
+          await db.query(
+            `
+              select id
+              from device_admin_sessions
+              where device_id = $1
+                and admin_card_id = $2
+                and status = 'ACTIVE'
+                and ended_at is null
+              limit 1
+            `,
+            [
+              device.id,
+              operation.returned_by_card_id,
+            ]
+          );
+
+        sessionStillActive =
+          Boolean(
+            sessionResult.rowCount &&
+            sessionResult.rowCount > 0
+          );
+
+      } else if (
+        operation.returned_by_role ===
+        "RECHARGE"
+      ) {
+
+        const sessionResult =
+          await db.query(
+            `
+              select id
+              from device_recharge_sessions
+              where device_id = $1
+                and opened_by_card_id = $2
+                and recharge_point_id = $3
+                and status = 'ACTIVE'
+                and ended_at is null
+              limit 1
+            `,
+            [
+              device.id,
+              operation.returned_by_card_id,
+              operation.recharge_point_id,
+            ]
+          );
+
+        sessionStillActive =
+          Boolean(
+            sessionResult.rowCount &&
+            sessionResult.rowCount > 0
+          );
+      }
+
+
+      if (
+        !sessionStillActive
+      ) {
+
+        return reply
+          .status(403)
+          .send({
+            error:
+              "RETURN_SESSION_NO_LONGER_ACTIVE",
+            message:
+              "La sesión que autorizó esta devolución ya no está activa.",
+          });
+      }
+
+
+      const activatedByRole =
+        String(
+          operation.activated_by_role
+        );
+
+      const activationFeeKnown =
+        Boolean(
+          operation.activation_fee_known
+        );
+
+      const refundAmount =
+        Number(
+          operation.refund_amount
+        );
+
+      const adminCreatedWithoutRefund =
+        activatedByRole ===
+          "ADMIN" &&
+        !activationFeeKnown;
+
+      const refundPolicy =
+        adminCreatedWithoutRefund
+          ? {
+              shouldRefundMoney:
+                false,
+              reason:
+                "ADMIN_CREATED",
+              message:
+                "NO DEVOLVER DINERO. Esta tarjeta fue creada por ADMIN y no tiene depósito de activación reembolsable.",
+            }
+          : {
+              shouldRefundMoney:
+                refundAmount > 0,
+              reason:
+                activationFeeKnown
+                  ? "ACTIVATION_FEE"
+                  : "NO_REFUND",
+              message:
+                refundAmount > 0
+                  ? `Devolver $${refundAmount.toFixed(2)} al cliente.`
+                  : "No hay dinero de activación que devolver.",
+            };
+
+
+      return {
+        found:
+          true,
+
+        operationId:
+          operation.id,
+
+        status:
+          operation.status,
+
+        authorizedAt:
+          operation.authorized_at,
+
+        requester: {
+          role:
+            operation.returned_by_role,
+          cardId:
+            Number(
+              operation.returned_by_card_id
+            ),
+          rechargePoint:
+            operation.recharge_point_id !==
+            null
+              ? {
+                  id:
+                    operation.recharge_point_id,
+                  code:
+                    operation.recharge_code,
+                  name:
+                    operation.recharge_point_name,
+                }
+              : null,
+        },
+
+        card: {
+          cardId:
+            Number(
+              operation.card_id
+            ),
+          uid:
+            operation.uid,
+          type:
+            "CUSTOMER",
+          activationId:
+            operation.activation_id,
+          balanceBefore:
+            Number(
+              operation.balance_before
+            ),
+          transactionCounterBefore:
+            Number(
+              operation.counter_before
+            ),
+        },
+
+        activation: {
+          activationId:
+            operation.activation_id,
+          activatedByRole,
+          activationFee:
+            Number(
+              operation.activation_fee
+            ),
+          activationFeeKnown,
+        },
+
+        refundAmount,
+        refundPolicy,
+
+        discarded: {
+          cash:
+            Number(
+              operation.discarded_cash
+            ),
+          promotional:
+            Number(
+              operation.discarded_promotional
+            ),
+          adminCredit:
+            Number(
+              operation.discarded_admin_credit
+            ),
+          legacy:
+            Number(
+              operation.discarded_legacy
+            ),
+          total:
+            Number(
+              operation.discarded_cash
+            ) +
+            Number(
+              operation.discarded_promotional
+            ) +
+            Number(
+              operation.discarded_admin_credit
+            ) +
+            Number(
+              operation.discarded_legacy
+            ),
+        },
+
+        targetState: {
+          cardId:
+            Number(
+              operation.card_id
+            ),
+          uid:
+            operation.uid,
+          cardType:
+            "CUSTOMER",
+          status:
+            "INACTIVE",
+          balance:
+            0,
+          transactionCounter:
+            0,
+        },
+      };
+    }
+  );
+
+
+  /*
+   * =====================================================
+   * RECONCILIAR DEVOLUCIÓN / RESET PENDIENTE
+   * =====================================================
+   *
+   * POST /customer-support/card-return/reconcile
+   *
+   * Android SOLO lee el NFC y envía el estado físico.
+   * Este endpoint nunca escribe NFC.
+   *
+   * Clasificación estricta:
+   *
+   * BEFORE exacto:
+   *   CUSTOMER / ACTIVE / balance_before / counter_before
+   *   -> falla de forma segura la autorización pendiente.
+   *
+   * AFTER exacto:
+   *   CUSTOMER / INACTIVE / 0 / 0
+   *   -> confirma la devolución existente.
+   *
+   * Cualquier otro estado:
+   *   -> NO confirma, NO falla y deja AUTHORIZED para
+   *      bloquear una segunda devolución sobre la activación.
+   * =====================================================
+   */
+
+  server.post<{
+    Body:
+      CardReturnReconcileBody;
+  }>(
+    "/customer-support/card-return/reconcile",
+
+    async (
+      request,
+      reply
+    ) => {
+
+      const {
+        operationId,
+        cardId,
+        uid,
+        deviceCode,
+        physicalCardId,
+        physicalCardType,
+        physicalStatus,
+        physicalBalance,
+        physicalTransactionCounter,
+      } = request.body;
+
+
+      if (
+        typeof operationId !==
+          "string" ||
+        operationId.trim().length ===
+          0
+      ) {
+
+        return reply
+          .status(400)
+          .send({
+            error:
+              "INVALID_OPERATION_ID",
+          });
+      }
+
+
+      if (
+        !Number.isSafeInteger(
+          cardId
+        ) ||
+        cardId <= 0 ||
+        typeof uid !==
+          "string" ||
+        uid.trim().length ===
+          0 ||
+        typeof deviceCode !==
+          "string" ||
+        deviceCode.trim().length ===
+          0 ||
+        !Number.isSafeInteger(
+          physicalCardId
+        ) ||
+        physicalCardId <= 0 ||
+        typeof physicalCardType !==
+          "string" ||
+        typeof physicalStatus !==
+          "string" ||
+        !Number.isSafeInteger(
+          physicalBalance
+        ) ||
+        physicalBalance < 0 ||
+        !Number.isSafeInteger(
+          physicalTransactionCounter
+        ) ||
+        physicalTransactionCounter < 0
+      ) {
+
+        return reply
+          .status(400)
+          .send({
+            error:
+              "INVALID_RECONCILIATION_BODY",
+          });
+      }
+
+
+      const normalizedUid =
+        uid
+          .trim()
+          .toUpperCase();
+
+      const normalizedDeviceCode =
+        deviceCode.trim();
+
+      const normalizedPhysicalCardType =
+        physicalCardType
+          .trim()
+          .toUpperCase();
+
+      const normalizedPhysicalStatus =
+        physicalStatus
+          .trim()
+          .toUpperCase();
+
+
+      const client =
+        await db.connect();
+
+
+      try {
+
+        await client.query(
+          "BEGIN"
+        );
+
+
+        const deviceResult =
+          await client.query(
+            `
+              select
+                id,
+                status
+              from devices
+              where device_code = $1
+              limit 1
+              for update
+            `,
+            [
+              normalizedDeviceCode,
+            ]
+          );
+
+
+        if (
+          deviceResult.rowCount ===
+          0
+        ) {
+
+          await client.query(
+            "ROLLBACK"
+          );
+
+          return reply
+            .status(404)
+            .send({
+              error:
+                "DEVICE_NOT_FOUND",
+            });
+        }
+
+
+        const device =
+          deviceResult.rows[0];
+
+
+        if (
+          device.status !==
+          "ACTIVE"
+        ) {
+
+          await client.query(
+            "ROLLBACK"
+          );
+
+          return reply
+            .status(409)
+            .send({
+              error:
+                "DEVICE_NOT_ACTIVE",
+            });
+        }
+
+
+        const operationResult =
+          await client.query(
+            `
+              select
+                cro.id,
+                cro.device_id,
+                cro.card_id,
+                cro.activation_id,
+                cro.uid,
+                cro.returned_by_role,
+                cro.returned_by_card_id,
+                cro.recharge_point_id,
+                cro.refund_amount,
+                cro.balance_before,
+                cro.counter_before,
+                cro.discarded_cash,
+                cro.discarded_promotional,
+                cro.discarded_admin_credit,
+                cro.discarded_legacy,
+                cro.status
+              from customer_card_return_operations cro
+              where cro.id = $1
+              limit 1
+              for update
+            `,
+            [
+              operationId.trim(),
+            ]
+          );
+
+
+        if (
+          operationResult.rowCount ===
+          0
+        ) {
+
+          await client.query(
+            "ROLLBACK"
+          );
+
+          return reply
+            .status(404)
+            .send({
+              error:
+                "CARD_RETURN_OPERATION_NOT_FOUND",
+            });
+        }
+
+
+        const operation =
+          operationResult.rows[0];
+
+
+        if (
+          operation.device_id !==
+            device.id
+        ) {
+
+          await client.query(
+            "ROLLBACK"
+          );
+
+          return reply
+            .status(409)
+            .send({
+              error:
+                "CARD_RETURN_DEVICE_MISMATCH",
+            });
+        }
+
+
+        if (
+          Number(
+            operation.card_id
+          ) !==
+            cardId
+        ) {
+
+          await client.query(
+            "ROLLBACK"
+          );
+
+          return reply
+            .status(409)
+            .send({
+              error:
+                "CARD_RETURN_CARD_MISMATCH",
+            });
+        }
+
+
+        if (
+          String(
+            operation.uid
+          )
+            .trim()
+            .toUpperCase() !==
+          normalizedUid
+        ) {
+
+          await client.query(
+            "ROLLBACK"
+          );
+
+          return reply
+            .status(409)
+            .send({
+              error:
+                "CARD_RETURN_UID_MISMATCH",
+            });
+        }
+
+
+        /*
+         * Idempotencia de recovery:
+         * si otra llamada ya cerró la operación, no intentamos
+         * volver a aplicar ningún efecto financiero.
+         */
+        if (
+          operation.status !==
+            "AUTHORIZED"
+        ) {
+
+          await client.query(
+            "ROLLBACK"
+          );
+
+          return {
+            reconciled:
+              true,
+            action:
+              operation.status ===
+                "CONFIRMED"
+                ? "ALREADY_CONFIRMED"
+                : "ALREADY_FAILED",
+            operationId:
+              operation.id,
+            status:
+              operation.status,
+            duplicated:
+              true,
+          };
+        }
+
+
+        /*
+         * La misma sesión que autorizó la devolución debe
+         * continuar activa.
+         */
+        let sessionStillActive =
+          false;
+
+
+        if (
+          operation.returned_by_role ===
+            "ADMIN"
+        ) {
+
+          const sessionResult =
+            await client.query(
+              `
+                select id
+                from device_admin_sessions
+                where device_id = $1
+                  and admin_card_id = $2
+                  and status = 'ACTIVE'
+                  and ended_at is null
+                limit 1
+              `,
+              [
+                device.id,
+                operation.returned_by_card_id,
+              ]
+            );
+
+          sessionStillActive =
+            Boolean(
+              sessionResult.rowCount &&
+              sessionResult.rowCount >
+                0
+            );
+
+        } else if (
+          operation.returned_by_role ===
+            "RECHARGE"
+        ) {
+
+          const sessionResult =
+            await client.query(
+              `
+                select id
+                from device_recharge_sessions
+                where device_id = $1
+                  and opened_by_card_id = $2
+                  and recharge_point_id = $3
+                  and status = 'ACTIVE'
+                  and ended_at is null
+                limit 1
+              `,
+              [
+                device.id,
+                operation.returned_by_card_id,
+                operation.recharge_point_id,
+              ]
+            );
+
+          sessionStillActive =
+            Boolean(
+              sessionResult.rowCount &&
+              sessionResult.rowCount >
+                0
+            );
+        }
+
+
+        if (
+          !sessionStillActive
+        ) {
+
+          await client.query(
+            "ROLLBACK"
+          );
+
+          return reply
+            .status(403)
+            .send({
+              error:
+                "RETURN_SESSION_NO_LONGER_ACTIVE",
+              message:
+                "La sesión que autorizó esta devolución ya no está activa.",
+            });
+        }
+
+
+        /*
+         * Una tarjeta en cuarentena no se reconcilia
+         * automáticamente. Conservamos AUTHORIZED.
+         */
+        const holdResult =
+          await client.query(
+            `
+              select
+                financial_hold,
+                financial_hold_reason,
+                financial_hold_at
+              from cards
+              where card_id = $1
+              limit 1
+              for update
+            `,
+            [
+              cardId,
+            ]
+          );
+
+
+        if (
+          holdResult.rowCount &&
+          holdResult.rowCount > 0 &&
+          holdResult.rows[0]
+            .financial_hold ===
+            true
+        ) {
+
+          await client.query(
+            "ROLLBACK"
+          );
+
+          return reply
+            .status(409)
+            .send({
+              error:
+                "CARD_FINANCIAL_HOLD",
+              reason:
+                holdResult.rows[0]
+                  .financial_hold_reason ??
+                "MANUAL_REVIEW_REQUIRED",
+              heldAt:
+                holdResult.rows[0]
+                  .financial_hold_at,
+              message:
+                "La tarjeta está en revisión manual y la devolución pendiente no puede reconciliarse automáticamente.",
+            });
+        }
+
+
+        const exactIdentity =
+          physicalCardId ===
+            cardId &&
+          normalizedPhysicalCardType ===
+            "CUSTOMER";
+
+
+        const exactBefore =
+          exactIdentity &&
+          normalizedPhysicalStatus ===
+            "ACTIVE" &&
+          physicalBalance ===
+            Number(
+              operation.balance_before
+            ) &&
+          physicalTransactionCounter ===
+            Number(
+              operation.counter_before
+            );
+
+
+        const exactAfter =
+          exactIdentity &&
+          normalizedPhysicalStatus ===
+            "INACTIVE" &&
+          physicalBalance ===
+            0 &&
+          physicalTransactionCounter ===
+            0;
+
+
+        if (
+          exactBefore
+        ) {
+
+          const failResult =
+            await client.query(
+              `
+                select
+                  financial_fail_card_return(
+                    $1,
+                    $2,
+                    $3
+                  ) as failed
+              `,
+              [
+                operation.id,
+                device.id,
+                "Reconciliación devolución: la NFC permaneció exactamente en BEFORE.",
+              ]
+            );
+
+
+          const failed =
+            Boolean(
+              failResult.rows[0]
+                ?.failed
+            );
+
+
+          if (
+            !failed
+          ) {
+
+            await client.query(
+              "ROLLBACK"
+            );
+
+            return reply
+              .status(409)
+              .send({
+                error:
+                  "CARD_RETURN_CANNOT_BE_FAILED",
+              });
+          }
+
+
+          await client.query(
+            "COMMIT"
+          );
+
+
+          return {
+            reconciled:
+              true,
+            action:
+              "FAILED_BEFORE",
+            operationId:
+              operation.id,
+            status:
+              "FAILED",
+            physicalState: {
+              cardId:
+                physicalCardId,
+              cardType:
+                normalizedPhysicalCardType,
+              status:
+                normalizedPhysicalStatus,
+              balance:
+                physicalBalance,
+              transactionCounter:
+                physicalTransactionCounter,
+            },
+            message:
+              "La NFC permaneció exactamente en el estado anterior. La devolución pendiente se cerró sin modificar saldo, activación ni ledger.",
+          };
+        }
+
+
+        if (
+          exactAfter
+        ) {
+
+          const confirmResult =
+            await client.query(
+              `
+                select *
+                from financial_confirm_card_return(
+                  $1,
+                  $2,
+                  $3,
+                  $4
+                )
+              `,
+              [
+                operation.id,
+                device.id,
+                cardId,
+                normalizedUid,
+              ]
+            );
+
+
+          const confirmed =
+            confirmResult.rows[0];
+
+
+          await client.query(
+            "COMMIT"
+          );
+
+
+          return {
+            reconciled:
+              true,
+            action:
+              "CONFIRMED_AFTER",
+            operationId:
+              operation.id,
+            status:
+              "CONFIRMED",
+            physicalState: {
+              cardId:
+                physicalCardId,
+              cardType:
+                normalizedPhysicalCardType,
+              status:
+                normalizedPhysicalStatus,
+              balance:
+                physicalBalance,
+              transactionCounter:
+                physicalTransactionCounter,
+            },
+            result: {
+              returnId:
+                confirmed?.return_id ??
+                null,
+              cardId:
+                confirmed?.card_id !==
+                undefined
+                  ? Number(
+                      confirmed.card_id
+                    )
+                  : cardId,
+              activationId:
+                confirmed?.activation_id ??
+                operation.activation_id,
+              refundAmount:
+                confirmed?.refund_amount !==
+                undefined
+                  ? Number(
+                      confirmed.refund_amount
+                    )
+                  : Number(
+                      operation.refund_amount
+                    ),
+              discardedCash:
+                confirmed?.discarded_cash !==
+                undefined
+                  ? Number(
+                      confirmed.discarded_cash
+                    )
+                  : Number(
+                      operation.discarded_cash
+                    ),
+              discardedPromotional:
+                confirmed?.discarded_promotional !==
+                undefined
+                  ? Number(
+                      confirmed.discarded_promotional
+                    )
+                  : Number(
+                      operation.discarded_promotional
+                    ),
+              discardedAdminCredit:
+                confirmed?.discarded_admin_credit !==
+                undefined
+                  ? Number(
+                      confirmed.discarded_admin_credit
+                    )
+                  : Number(
+                      operation.discarded_admin_credit
+                    ),
+              discardedLegacy:
+                confirmed?.discarded_legacy !==
+                undefined
+                  ? Number(
+                      confirmed.discarded_legacy
+                    )
+                  : Number(
+                      operation.discarded_legacy
+                    ),
+              duplicated:
+                Boolean(
+                  confirmed?.duplicated
+                ),
+            },
+            message:
+              "La NFC coincide exactamente con el estado devuelto. La devolución pendiente fue confirmada sin reescribir la tarjeta.",
+          };
+        }
+
+
+        /*
+         * Estado desconocido:
+         * deliberadamente NO llamamos confirm ni fail.
+         * La operación sigue AUTHORIZED y el índice parcial
+         * impide otra devolución abierta para esa activación.
+         */
+        await client.query(
+          "ROLLBACK"
+        );
+
+
+        return reply
+          .status(409)
+          .send({
+            error:
+              "CARD_RETURN_MANUAL_REVIEW_REQUIRED",
+            operationId:
+              operation.id,
+            status:
+              "AUTHORIZED",
+            physicalState: {
+              cardId:
+                physicalCardId,
+              cardType:
+                normalizedPhysicalCardType,
+              status:
+                normalizedPhysicalStatus,
+              balance:
+                physicalBalance,
+              transactionCounter:
+                physicalTransactionCounter,
+            },
+            expectedBefore: {
+              cardId,
+              cardType:
+                "CUSTOMER",
+              status:
+                "ACTIVE",
+              balance:
+                Number(
+                  operation.balance_before
+                ),
+              transactionCounter:
+                Number(
+                  operation.counter_before
+                ),
+            },
+            expectedAfter: {
+              cardId,
+              cardType:
+                "CUSTOMER",
+              status:
+                "INACTIVE",
+              balance:
+                0,
+              transactionCounter:
+                0,
+            },
+            message:
+              "El estado físico no coincide exactamente con BEFORE ni AFTER. No se confirmó ni falló la devolución; requiere revisión manual.",
+          });
+
+
+      } catch (
+        error: any
+      ) {
+
+        await client.query(
+          "ROLLBACK"
+        );
+
+
+        const message =
+          typeof error?.message ===
+            "string"
+            ? error.message
+            : "INTERNAL_ERROR";
+
+
+        const knownConflictErrors = [
+          "CARD_RETURN_DEVICE_MISMATCH",
+          "CARD_RETURN_CARD_MISMATCH",
+          "CARD_RETURN_UID_MISMATCH",
+          "CARD_RETURN_OPERATION_NOT_AUTHORIZED",
+          "CARD_ACTIVATION_CHANGED",
+          "CARD_BALANCE_CHANGED_AFTER_RETURN_AUTHORIZATION",
+          "CARD_COUNTER_CHANGED_AFTER_RETURN_AUTHORIZATION",
+          "ACTIVE_ACTIVATION_NOT_FOUND_DURING_CONFIRM",
+          "CARD_NOT_CUSTOMER",
+          "UID_MISMATCH",
         ];
 
 
