@@ -289,6 +289,32 @@ export async function customerSupportRoutes(
           ]
         );
 
+      /*
+       * GAME puede consultar el historial CUSTOMER únicamente
+       * en modo read-only y con sesión activa en este dispositivo.
+       */
+      const gameSessionResult =
+        await db.query(
+          `
+          select
+              s.id,
+              s.started_at,
+              s.game_id,
+              g.game_code,
+              g.name as game_name
+          from device_game_sessions s
+          join games g
+              on g.id = s.game_id
+          where s.device_id = $1
+            and s.status = 'ACTIVE'
+            and s.ended_at is null
+          limit 1
+          `,
+          [
+            device.id,
+          ]
+        );
+
       const hasAdminSession =
         Boolean(
           adminSessionResult.rowCount &&
@@ -301,9 +327,16 @@ export async function customerSupportRoutes(
           rechargeSessionResult.rowCount > 0
         );
 
+      const hasGameSession =
+        Boolean(
+          gameSessionResult.rowCount &&
+          gameSessionResult.rowCount > 0
+        );
+
       if (
         !hasAdminSession &&
-        !hasRechargeSession
+        !hasRechargeSession &&
+        !hasGameSession
       ) {
 
         return reply.status(403).send({
@@ -311,7 +344,7 @@ export async function customerSupportRoutes(
             "CUSTOMER_SUPPORT_PERMISSION_REQUIRED",
 
           message:
-            "Se necesita una sesión ADMIN o RECHARGE activa para consultar el historial.",
+            "Se necesita una sesión ADMIN, RECHARGE o GAME activa para consultar el historial.",
         });
       }
 
@@ -323,34 +356,47 @@ export async function customerSupportRoutes(
         hasAdminSession
           ? {
               role: "ADMIN",
-
               sessionId:
                 adminSessionResult
                   .rows[0]
                   .id,
-
               location: null,
             }
-          : {
-              role: "RECHARGE",
-
-              sessionId:
-                rechargeSessionResult
-                  .rows[0]
-                  .id,
-
-              location: {
-                code:
+          : hasRechargeSession
+            ? {
+                role: "RECHARGE",
+                sessionId:
                   rechargeSessionResult
                     .rows[0]
-                    .recharge_code,
-
-                name:
-                  rechargeSessionResult
+                    .id,
+                location: {
+                  code:
+                    rechargeSessionResult
+                      .rows[0]
+                      .recharge_code,
+                  name:
+                    rechargeSessionResult
+                      .rows[0]
+                      .recharge_point_name,
+                },
+              }
+            : {
+                role: "GAME",
+                sessionId:
+                  gameSessionResult
                     .rows[0]
-                    .recharge_point_name,
-              },
-            };
+                    .id,
+                location: {
+                  code:
+                    gameSessionResult
+                      .rows[0]
+                      .game_code,
+                  name:
+                    gameSessionResult
+                      .rows[0]
+                      .game_name,
+                },
+              };
 
       /*
        * =================================================
@@ -733,6 +779,7 @@ export async function customerSupportRoutes(
                 row.payment_method,
 
               paymentMethodEditable:
+                requester.role !== "GAME" &&
                 row.checkout_id !== null &&
                 row.payment_method !== null,
 
@@ -808,7 +855,9 @@ export async function customerSupportRoutes(
 
 
       const financialIncidents =
-        incidentResult.rows.map(
+        requester.role === "GAME"
+          ? []
+          : incidentResult.rows.map(
           (row) => ({
             incidentId:
               row.id,
