@@ -7,11 +7,19 @@ type CreatePromotionBody = {
   name: string;
   cashAmount: number;
   promotionalAmount: number;
+  scope?: string;
+  rechargePointIds?: string[];
 };
 
 type PromotionStatusBody = {
   deviceCode: string;
   active: boolean;
+};
+
+type PromotionScopeBody = {
+  deviceCode: string;
+  scope: string;
+  rechargePointIds?: string[];
 };
 
 type ActivePromotionsHeaders = {
@@ -68,6 +76,8 @@ export async function promotionManagementRoutes(
         name,
         cashAmount,
         promotionalAmount,
+        scope,
+        rechargePointIds,
       } = request.body;
 
       if (
@@ -112,6 +122,52 @@ export async function promotionManagementRoutes(
         });
       }
 
+      const normalizedScope =
+        scope === undefined
+          ? "ALL"
+          : typeof scope === "string"
+            ? scope.trim().toUpperCase()
+            : "";
+
+      if (
+        normalizedScope !== "ALL" &&
+        normalizedScope !== "SELECTED"
+      ) {
+        return reply.status(400).send({
+          error: "INVALID_PROMOTION_SCOPE",
+          message: "scope debe ser ALL o SELECTED.",
+        });
+      }
+
+      let normalizedRechargePointIds: string[] = [];
+
+      if (normalizedScope === "SELECTED") {
+        if (!Array.isArray(rechargePointIds) || rechargePointIds.length === 0) {
+          return reply.status(400).send({
+            error: "PROMOTION_RECHARGE_POINTS_REQUIRED",
+            message: "Una promoción SELECTED requiere al menos un punto de recarga.",
+          });
+        }
+
+        const uuidPattern =
+          /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+
+        for (const rechargePointId of rechargePointIds) {
+          if (
+            typeof rechargePointId !== "string" ||
+            !uuidPattern.test(rechargePointId.trim())
+          ) {
+            return reply.status(400).send({
+              error: "INVALID_RECHARGE_POINT_ID",
+            });
+          }
+        }
+
+        normalizedRechargePointIds = Array.from(
+          new Set(rechargePointIds.map((id) => id.trim()))
+        );
+      }
+
       const client = await db.connect();
 
       try {
@@ -131,6 +187,25 @@ export async function promotionManagementRoutes(
           });
         }
 
+        if (normalizedScope === "SELECTED") {
+          const rechargePointsResult = await client.query(
+            `
+            select id
+            from recharge_points
+            where id = any($1::uuid[])
+            `,
+            [normalizedRechargePointIds]
+          );
+
+          if (rechargePointsResult.rowCount !== normalizedRechargePointIds.length) {
+            await client.query("ROLLBACK");
+            return reply.status(400).send({
+              error: "RECHARGE_POINT_NOT_FOUND",
+              message: "Uno o más puntos de recarga seleccionados no existen.",
+            });
+          }
+        }
+
         const result = await client.query(
           `
           insert into promotions (
@@ -138,15 +213,10 @@ export async function promotionManagementRoutes(
               cash_amount,
               promotional_amount,
               active,
-              created_by_admin_card_id
+              created_by_admin_card_id,
+              scope
           )
-          values (
-              $1,
-              $2,
-              $3,
-              true,
-              $4
-          )
+          values ($1, $2, $3, true, $4, $5)
           returning
               id,
               name,
@@ -155,6 +225,7 @@ export async function promotionManagementRoutes(
               total_credit_amount,
               active,
               created_by_admin_card_id,
+              scope,
               created_at,
               updated_at
           `,
@@ -163,10 +234,43 @@ export async function promotionManagementRoutes(
             cashAmount,
             promotionalAmount,
             admin.admin_card_id,
+            normalizedScope,
           ]
         );
 
         const promotion = result.rows[0];
+
+        if (normalizedScope === "SELECTED") {
+          await client.query(
+            `
+            insert into promotion_recharge_points (
+                promotion_id,
+                recharge_point_id
+            )
+            select $1, unnest($2::uuid[])
+            `,
+            [promotion.id, normalizedRechargePointIds]
+          );
+        }
+
+        const assignedRechargePointsResult =
+          normalizedScope === "SELECTED"
+            ? await client.query(
+                `
+                select
+                    rp.id,
+                    rp.recharge_code,
+                    rp.name,
+                    rp.status
+                from promotion_recharge_points prp
+                join recharge_points rp
+                    on rp.id = prp.recharge_point_id
+                where prp.promotion_id = $1
+                order by rp.name asc, rp.recharge_code asc
+                `,
+                [promotion.id]
+              )
+            : { rows: [] };
 
         await client.query("COMMIT");
 
@@ -175,18 +279,19 @@ export async function promotionManagementRoutes(
           promotion: {
             id: promotion.id,
             name: promotion.name,
-            cashAmount: Number(
-              promotion.cash_amount
-            ),
-            promotionalAmount: Number(
-              promotion.promotional_amount
-            ),
-            totalCreditAmount: Number(
-              promotion.total_credit_amount
-            ),
+            cashAmount: Number(promotion.cash_amount),
+            promotionalAmount: Number(promotion.promotional_amount),
+            totalCreditAmount: Number(promotion.total_credit_amount),
             active: promotion.active,
-            createdByAdminCardId: Number(
-              promotion.created_by_admin_card_id
+            createdByAdminCardId: Number(promotion.created_by_admin_card_id),
+            scope: promotion.scope,
+            rechargePoints: assignedRechargePointsResult.rows.map(
+              (row: any) => ({
+                id: row.id,
+                code: row.recharge_code,
+                name: row.name,
+                status: row.status,
+              })
             ),
             createdAt: promotion.created_at,
             updatedAt: promotion.updated_at,
@@ -249,6 +354,7 @@ export async function promotionManagementRoutes(
               total_credit_amount,
               active,
               created_by_admin_card_id,
+              scope,
               created_at,
               updated_at
           from promotions
@@ -258,6 +364,40 @@ export async function promotionManagementRoutes(
               created_at desc
           `
         );
+
+        const assignmentsResult = await client.query(
+          `
+          select
+              prp.promotion_id,
+              rp.id,
+              rp.recharge_code,
+              rp.name,
+              rp.status
+          from promotion_recharge_points prp
+          join recharge_points rp
+              on rp.id = prp.recharge_point_id
+          order by
+              prp.promotion_id,
+              rp.name asc,
+              rp.recharge_code asc
+          `
+        );
+
+        const rechargePointsByPromotion = new Map<string, any[]>();
+
+        for (const row of assignmentsResult.rows) {
+          const current =
+            rechargePointsByPromotion.get(row.promotion_id) ?? [];
+
+          current.push({
+            id: row.id,
+            code: row.recharge_code,
+            name: row.name,
+            status: row.status,
+          });
+
+          rechargePointsByPromotion.set(row.promotion_id, current);
+        }
 
         await client.query("COMMIT");
 
@@ -282,6 +422,9 @@ export async function promotionManagementRoutes(
                       row.created_by_admin_card_id
                     )
                   : null,
+              scope: row.scope,
+              rechargePoints:
+                rechargePointsByPromotion.get(row.id) ?? [],
               createdAt: row.created_at,
               updatedAt: row.updated_at,
             })
@@ -423,6 +566,283 @@ export async function promotionManagementRoutes(
       }
     }
   );
+
+  server.patch<{
+    Params: {
+      promotionId: string;
+    };
+    Body: PromotionScopeBody;
+  }>(
+    "/admin/promotions/:promotionId/scope",
+    async (request, reply) => {
+      const { promotionId } = request.params;
+      const {
+        deviceCode,
+        scope,
+        rechargePointIds,
+      } = request.body;
+
+      if (
+        typeof promotionId !== "string" ||
+        promotionId.trim().length === 0
+      ) {
+        return reply.status(400).send({
+          error: "INVALID_PROMOTION_ID",
+        });
+      }
+
+      if (
+        typeof deviceCode !== "string" ||
+        deviceCode.trim().length === 0
+      ) {
+        return reply.status(400).send({
+          error: "INVALID_DEVICE_CODE",
+        });
+      }
+
+      const normalizedScope =
+        typeof scope === "string"
+          ? scope.trim().toUpperCase()
+          : "";
+
+      if (
+        normalizedScope !== "ALL" &&
+        normalizedScope !== "SELECTED"
+      ) {
+        return reply.status(400).send({
+          error: "INVALID_PROMOTION_SCOPE",
+          message: "scope debe ser ALL o SELECTED.",
+        });
+      }
+
+      let normalizedRechargePointIds: string[] = [];
+
+      if (normalizedScope === "SELECTED") {
+        if (
+          !Array.isArray(rechargePointIds) ||
+          rechargePointIds.length === 0
+        ) {
+          return reply.status(400).send({
+            error: "PROMOTION_RECHARGE_POINTS_REQUIRED",
+            message:
+              "Una promoción SELECTED requiere al menos un punto de recarga.",
+          });
+        }
+
+        const uuidPattern =
+          /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+
+        for (const rechargePointId of rechargePointIds) {
+          if (
+            typeof rechargePointId !== "string" ||
+            !uuidPattern.test(rechargePointId.trim())
+          ) {
+            return reply.status(400).send({
+              error: "INVALID_RECHARGE_POINT_ID",
+            });
+          }
+        }
+
+        normalizedRechargePointIds = Array.from(
+          new Set(
+            rechargePointIds.map(
+              (rechargePointId) =>
+                rechargePointId.trim()
+            )
+          )
+        );
+      }
+
+      const client = await db.connect();
+
+      try {
+        await client.query("BEGIN");
+
+        const admin = await getAdminActor(
+          client,
+          deviceCode
+        );
+
+        if (admin === null) {
+          await client.query("ROLLBACK");
+          return reply.status(403).send({
+            error: "ADMIN_PERMISSION_REQUIRED",
+            message:
+              "Se necesita una sesión ADMIN activa.",
+          });
+        }
+
+        const promotionResult =
+          await client.query(
+            `
+              select id
+              from promotions
+              where id = $1
+              limit 1
+              for update
+            `,
+            [promotionId.trim()]
+          );
+
+        if (promotionResult.rowCount === 0) {
+          await client.query("ROLLBACK");
+          return reply.status(404).send({
+            error: "PROMOTION_NOT_FOUND",
+          });
+        }
+
+        if (normalizedScope === "SELECTED") {
+          const rechargePointsResult =
+            await client.query(
+              `
+                select id
+                from recharge_points
+                where id = any($1::uuid[])
+              `,
+              [normalizedRechargePointIds]
+            );
+
+          if (
+            rechargePointsResult.rowCount !==
+            normalizedRechargePointIds.length
+          ) {
+            await client.query("ROLLBACK");
+            return reply.status(400).send({
+              error: "RECHARGE_POINT_NOT_FOUND",
+              message:
+                "Uno o más puntos de recarga seleccionados no existen.",
+            });
+          }
+        }
+
+        await client.query(
+          `
+            delete from promotion_recharge_points
+            where promotion_id = $1
+          `,
+          [promotionId.trim()]
+        );
+
+        if (normalizedScope === "SELECTED") {
+          await client.query(
+            `
+              insert into promotion_recharge_points (
+                  promotion_id,
+                  recharge_point_id
+              )
+              select $1, unnest($2::uuid[])
+            `,
+            [
+              promotionId.trim(),
+              normalizedRechargePointIds,
+            ]
+          );
+        }
+
+        const updatedPromotionResult =
+          await client.query(
+            `
+              update promotions
+              set
+                  scope = $2,
+                  updated_at = now()
+              where id = $1
+              returning
+                  id,
+                  name,
+                  cash_amount,
+                  promotional_amount,
+                  total_credit_amount,
+                  active,
+                  created_by_admin_card_id,
+                  scope,
+                  created_at,
+                  updated_at
+            `,
+            [
+              promotionId.trim(),
+              normalizedScope,
+            ]
+          );
+
+        const promotion =
+          updatedPromotionResult.rows[0];
+
+        const assignedRechargePointsResult =
+          normalizedScope === "SELECTED"
+            ? await client.query(
+                `
+                  select
+                      rp.id,
+                      rp.recharge_code,
+                      rp.name,
+                      rp.status
+                  from promotion_recharge_points prp
+                  join recharge_points rp
+                      on rp.id = prp.recharge_point_id
+                  where prp.promotion_id = $1
+                  order by
+                      rp.name asc,
+                      rp.recharge_code asc
+                `,
+                [promotionId.trim()]
+              )
+            : { rows: [] };
+
+        await client.query("COMMIT");
+
+        return {
+          updated: true,
+          promotion: {
+            id: promotion.id,
+            name: promotion.name,
+            cashAmount:
+              Number(promotion.cash_amount),
+            promotionalAmount:
+              Number(promotion.promotional_amount),
+            totalCreditAmount:
+              Number(promotion.total_credit_amount),
+            active: promotion.active,
+            createdByAdminCardId:
+              promotion.created_by_admin_card_id !== null
+                ? Number(
+                    promotion.created_by_admin_card_id
+                  )
+                : null,
+            scope: promotion.scope,
+            rechargePoints:
+              assignedRechargePointsResult.rows.map(
+                (row: any) => ({
+                  id: row.id,
+                  code: row.recharge_code,
+                  name: row.name,
+                  status: row.status,
+                })
+              ),
+            createdAt: promotion.created_at,
+            updatedAt: promotion.updated_at,
+          },
+        };
+      } catch (error: any) {
+        await client.query("ROLLBACK");
+
+        if (error?.code === "22P02") {
+          return reply.status(400).send({
+            error: "INVALID_PROMOTION_ID",
+          });
+        }
+
+        server.log.error(error);
+
+        return reply.status(500).send({
+          error: "INTERNAL_ERROR",
+        });
+      } finally {
+        client.release();
+      }
+    }
+  );
+
 
   /*
    * =====================================================
@@ -567,23 +987,69 @@ export async function promotionManagementRoutes(
             });
         }
 
+        const rechargeSessionResult =
+          await client.query(
+            `
+            select
+                s.recharge_point_id
+            from device_recharge_sessions s
+            join recharge_points rp
+                on rp.id = s.recharge_point_id
+            where s.device_id = $1
+              and s.status = 'ACTIVE'
+              and s.ended_at is null
+            limit 1
+            `,
+            [device.id]
+          );
+
+        if (rechargeSessionResult.rowCount === 0) {
+          return reply
+            .status(403)
+            .send({
+              error:
+                "RECHARGE_SESSION_REQUIRED",
+              message:
+                "Se necesita una sesión RECHARGE activa.",
+            });
+        }
+
+        const rechargePointId =
+          rechargeSessionResult.rows[0]
+            .recharge_point_id;
+
         const promotionsResult =
           await client.query(
             `
             select
-                id,
-                name,
-                cash_amount,
-                promotional_amount,
-                total_credit_amount
+                p.id,
+                p.name,
+                p.cash_amount,
+                p.promotional_amount,
+                p.total_credit_amount
 
-            from active_promotions
+            from promotions p
+
+            where p.active = true
+              and (
+                p.scope = 'ALL'
+                or (
+                  p.scope = 'SELECTED'
+                  and exists (
+                    select 1
+                    from promotion_recharge_points prp
+                    where prp.promotion_id = p.id
+                      and prp.recharge_point_id = $1
+                  )
+                )
+              )
 
             order by
-                cash_amount asc,
-                total_credit_amount asc,
-                created_at asc
-            `
+                p.cash_amount asc,
+                p.total_credit_amount asc,
+                p.created_at asc
+            `,
+            [rechargePointId]
           );
 
         await client.query(

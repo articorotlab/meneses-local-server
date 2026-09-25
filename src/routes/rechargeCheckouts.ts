@@ -800,15 +800,28 @@ export async function rechargeCheckoutRoutes(
                   promotional_amount,
                   total_credit_amount
 
-              from promotions
+              from promotions p
 
-              where id = $1
-                and active = true
+              where p.id = $1
+                and p.active = true
+                and (
+                  p.scope = 'ALL'
+                  or (
+                    p.scope = 'SELECTED'
+                    and exists (
+                      select 1
+                      from promotion_recharge_points prp
+                      where prp.promotion_id = p.id
+                        and prp.recharge_point_id = $2
+                    )
+                  )
+                )
 
               limit 1
               `,
               [
                 normalizedPromotionId,
+                rechargePointId,
               ]
             );
 
